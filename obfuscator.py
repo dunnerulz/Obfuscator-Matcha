@@ -42,6 +42,12 @@ def discover_node_classes():
     global BINOP, ADD_OP, SUB_OP, MULT_OP, DIV_OP, EQ_OP, TRUE_NODE
     global NUMERIC_FOR, GENERIC_FOR, SPECIFIC_BINOP_MODE
     global ANON_FUNC
+    global BXOR_OP, BAND_OP, BNOT_OP  # Bitwise operators for MBA
+    
+    # Initialize bitwise operators
+    BXOR_OP = None
+    BAND_OP = None
+    BNOT_OP = None
     
     # 1. Discover Binary Operation Structure
     try:
@@ -75,6 +81,15 @@ def discover_node_classes():
                 EQ_OP = type(eq_node.op)
             else:
                 EQ_OP = getattr(astnodes, "Eq", getattr(astnodes, "EQ", None))
+            
+            # Discover bitwise operators for MBA
+            try:
+                bxor_tree = ast.parse("local x = bit32.bxor(1, 1)")
+                band_tree = ast.parse("local x = bit32.band(1, 1)")
+                bnot_tree = ast.parse("local x = bit32.bnot(1)")
+                # These are function calls, not operators - we'll handle them differently
+            except:
+                pass
 
         elif add_node:
             # Specific Mode: AddOp(left=..., right=...)
@@ -230,43 +245,133 @@ class MatchaObfuscator:
                 self.var_count += 1  # Keep count for stats
                 return name
 
-    def generate_mutated_expression(self, value):
+    def generate_mutated_expression(self, value, depth=0):
         """
-        Turns a simple integer into a math expression (mutation).
+        Turns a simple integer into an obfuscated math expression.
+        
+        Uses only addition of positive numbers to guarantee correct results.
+        The expressions look complex but always evaluate to the correct value.
         
         Args:
-            value (int): The target number.
+            value (int): The target number (must be positive for array indices).
+            depth (int): Recursion depth to prevent infinite nesting.
             
         Returns:
-            BinOp: An AST node representing the math expression.
+            Node: An AST node representing the math expression.
         """
         # Ensure we have required operators
-        if not isinstance(value, int) or not ADD_OP or not SUB_OP:
+        if not isinstance(value, (int, float)) or not ADD_OP or not SUB_OP:
             return Number(value)
-            
-        # Pick a random "Mutation Mode"
-        mode = random.choice(['add', 'sub'])
         
-        if mode == 'add':
-            # value = a + b
-            a = random.randint(1, 1000)
+        # Convert to int
+        value = int(value)
+        
+        # For very small or negative values, just return the raw number
+        if value <= 1:
+            return Number(value)
+        
+        # Limit recursion depth
+        max_depth = 1  # Keep it shallow to avoid issues
+        
+        if depth >= max_depth:
+            # At max depth, just split into two positive numbers
+            a = random.randint(1, value - 1)
             b = value - a
             if SPECIFIC_BINOP_MODE:
                 return ADD_OP(Number(a), Number(b))
             else:
                 return BINOP(ADD_OP(), Number(a), Number(b))
-            
-        elif mode == 'sub':
-            # value = a - b
-            offset = random.randint(1, 1000)
-            a = value + offset
-            b = offset
+        
+        # Choose mutation strategy
+        strategy = random.randint(1, 4)
+        
+        if strategy == 1:
+            # Simple split: value = a + b
+            a = random.randint(1, value - 1)
+            b = value - a
+            a_node = self.generate_mutated_expression(a, depth + 1)
+            b_node = self.generate_mutated_expression(b, depth + 1)
             if SPECIFIC_BINOP_MODE:
-                return SUB_OP(Number(a), Number(b))
+                return ADD_OP(a_node, b_node)
             else:
-                return BINOP(SUB_OP(), Number(a), Number(b))
+                return BINOP(ADD_OP(), a_node, b_node)
+        
+        elif strategy == 2:
+            # Triple split: value = a + b + c
+            a = random.randint(1, max(1, value // 3))
+            remainder = value - a
+            b = random.randint(1, max(1, remainder - 1))
+            c = remainder - b
+            if c < 1:
+                c = 1
+                b = remainder - 1
+            if b < 1:
+                # Fallback to simple split
+                a = random.randint(1, value - 1)
+                b = value - a
+                if SPECIFIC_BINOP_MODE:
+                    return ADD_OP(Number(a), Number(b))
+                else:
+                    return BINOP(ADD_OP(), Number(a), Number(b))
             
-        return Number(value)
+            if SPECIFIC_BINOP_MODE:
+                ab_node = ADD_OP(Number(a), Number(b))
+                return ADD_OP(ab_node, Number(c))
+            else:
+                ab_node = BINOP(ADD_OP(), Number(a), Number(b))
+                return BINOP(ADD_OP(), ab_node, Number(c))
+        
+        elif strategy == 3:
+            # Subtraction with larger first operand: value = (value + offset) - offset
+            offset = random.randint(50, 300)
+            larger = value + offset
+            if SPECIFIC_BINOP_MODE:
+                return SUB_OP(Number(larger), Number(offset))
+            else:
+                return BINOP(SUB_OP(), Number(larger), Number(offset))
+        
+        else:
+            # Multi-term: value = a + b + c - d where (a + b + c) > d and result = value
+            # Keep it simple: a + b + c = value + d
+            d = random.randint(50, 200)
+            total = value + d
+            a = random.randint(1, max(1, total // 3))
+            remainder = total - a
+            b = random.randint(1, max(1, remainder // 2))
+            c = remainder - b
+            
+            if a < 1 or b < 1 or c < 1:
+                # Fallback
+                if SPECIFIC_BINOP_MODE:
+                    return ADD_OP(Number(value - 1), Number(1))
+                else:
+                    return BINOP(ADD_OP(), Number(value - 1), Number(1))
+            
+            if SPECIFIC_BINOP_MODE:
+                ab_node = ADD_OP(Number(a), Number(b))
+                abc_node = ADD_OP(ab_node, Number(c))
+                return SUB_OP(abc_node, Number(d))
+            else:
+                ab_node = BINOP(ADD_OP(), Number(a), Number(b))
+                abc_node = BINOP(ADD_OP(), ab_node, Number(c))
+                return BINOP(SUB_OP(), abc_node, Number(d))
+    
+    def _create_bit32_call(self, func_name, a, b):
+        """Create a bit32["func"](a, b) call node."""
+        # String node requires (s, raw) - pass plain func_name for both
+        # to_lua_source handles quoting automatically
+        func_index = Index(String(func_name, func_name), Name('bit32'), notation=1)
+        return Call(func_index, [Number(a), Number(b)])
+    
+    def _create_bit32_call_single(self, func_name, a):
+        """Create a bit32["func"](a) call node (for bnot)."""
+        func_index = Index(String(func_name, func_name), Name('bit32'), notation=1)
+        return Call(func_index, [Number(a)])
+    
+    def _create_bit32_call_node(self, func_name, node_a, node_b):
+        """Create a bit32["func"](node_a, node_b) call where args are AST nodes."""
+        func_index = Index(String(func_name, func_name), Name('bit32'), notation=1)
+        return Call(func_index, [node_a, node_b])
 
     def generate_junk_node(self):
         """
@@ -683,13 +788,15 @@ class MatchaObfuscator:
             text (str): The raw string to encrypt.
             
         Returns:
-            list: A list of integers where each byte is XOR'd with (key + index) % 255.
+            list: A list of integers where each byte is XOR'd with (key + index) % 256.
         """
         encrypted = []
         for i, char in enumerate(text):
             # Mix index 'i' into the key for position-dependent encryption
-            # Use modulo 255 to keep it byte-sized
-            enc_byte = (ord(char) ^ (self.xor_key + i)) % 255
+            # Apply modulo 256 to the key BEFORE XOR to keep it byte-sized
+            # XOR of two bytes always produces a valid byte (0-255)
+            k = (self.xor_key + i) % 256
+            enc_byte = ord(char) ^ k
             encrypted.append(enc_byte)
         return encrypted
 
@@ -1318,27 +1425,79 @@ class MatchaObfuscator:
         # Generate randomized decryptor function name
         decryptor_name = self.generate_var_name()
         
-        # Define Bit32 Polyfill for environments missing it
+        # Define standalone Bit32 implementation
+        # Creates its own bit32 table to avoid read-only global issues in Roblox/Matcha
         bit32_polyfill = """
-local bit32 = bit32 or (function()
-    local m = {}
-    function m.bxor(a, b)
-        local p, c = 1, 0
-        while a > 0 and b > 0 do
-            local ra, rb = a % 2, b % 2
-            if ra ~= rb then c = c + p end
-            a, b, p = (a - ra) / 2, (b - rb) / 2, p * 2
-        end
-        if a < b then a = b end
-        while a > 0 do
-            local ra = a % 2
-            if ra > 0 then c = c + p end
-            a, p = (a - ra) / 2, p * 2
-        end
-        return c
+bit32 = {}
+local N = 32
+local P = 2 ^ N
+bit32.bnot = function(x)
+    x = x % P
+    return (P - 1) - x
+end
+bit32.band = function(x, y)
+    if (y == 255) then return x % 256 end
+    if (y == 65535) then return x % 65536 end
+    if (y == 4294967295) then return x % 4294967296 end
+    x, y = x % P, y % P
+    local r = 0
+    local p = 1
+    for i = 1, N do
+        local a, b = x % 2, y % 2
+        x, y = math.floor(x / 2), math.floor(y / 2)
+        if ((a + b) == 2) then r = r + p end
+        p = 2 * p
     end
-    return m
-end)()
+    return r
+end
+bit32.bor = function(x, y)
+    if (y == 255) then return (x - (x % 256)) + 255 end
+    if (y == 65535) then return (x - (x % 65536)) + 65535 end
+    if (y == 4294967295) then return 4294967295 end
+    x, y = x % P, y % P
+    local r = 0
+    local p = 1
+    for i = 1, N do
+        local a, b = x % 2, y % 2
+        x, y = math.floor(x / 2), math.floor(y / 2)
+        if ((a + b) >= 1) then r = r + p end
+        p = 2 * p
+    end
+    return r
+end
+bit32.bxor = function(x, y)
+    x, y = x % P, y % P
+    local r = 0
+    local p = 1
+    for i = 1, N do
+        local a, b = x % 2, y % 2
+        x, y = math.floor(x / 2), math.floor(y / 2)
+        if ((a + b) == 1) then r = r + p end
+        p = 2 * p
+    end
+    return r
+end
+bit32.lshift = function(x, s_amount)
+    if (math.abs(s_amount) >= N) then return 0 end
+    x = x % P
+    if (s_amount < 0) then return math.floor(x * (2 ^ s_amount))
+    else return (x * (2 ^ s_amount)) % P end
+end
+bit32.rshift = function(x, s_amount)
+    if (math.abs(s_amount) >= N) then return 0 end
+    x = x % P
+    if (s_amount > 0) then return math.floor(x * (2 ^ -s_amount))
+    else return (x * (2 ^ -s_amount)) % P end
+end
+bit32.arshift = function(x, s_amount)
+    if (math.abs(s_amount) >= N) then return 0 end
+    x = x % P
+    if (s_amount > 0) then
+        local add = 0
+        if (x >= (P / 2)) then add = P - (2 ^ (N - s_amount)) end
+        return math.floor(x * (2 ^ -s_amount)) + add
+    else return (x * (2 ^ -s_amount)) % P end
+end
 """
 
         # Define the Lua decryptor function string
@@ -1348,7 +1507,7 @@ end)()
             f"local function {decryptor_name}(bytes)\n"
             f"    local res = {{}}\n"
             f"    for i, b in ipairs(bytes) do\n"
-            f"        local k = ({self.xor_key} + (i - 1)) % 255\n"
+            f"        local k = ({self.xor_key} + (i - 1)) % 256\n"
             f"        table.insert(res, string.char(bit32.bxor(b, k)))\n"
             f"    end\n"
             f"    return table.concat(res)\n"
