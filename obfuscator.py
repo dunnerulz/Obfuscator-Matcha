@@ -562,13 +562,25 @@ class MatchaObfuscator:
                 next_state = end_state
                 
             # Prepare Block: Statements + State Transition
-            stmts = chunks[i]
+            stmts = list(chunks[i])  # Make a copy to avoid modifying original
             # Add state transition: _state = next_state
             # Note: This is a normal Assign, not LocalAssign, as it updates the existing var
             state_transition = Assign([Name(state_var_name)], [Number(next_state)])
             
-            # Combine statements and transition
-            block_body = Block(stmts + [state_transition])
+            # CRITICAL FIX: Check if the last statement is a Return
+            # In Lua, 'return' must be the last statement in a block
+            # So we insert the state transition BEFORE the return, not after
+            if stmts and isinstance(stmts[-1], Return):
+                # Pop return, add state transition, put return back
+                return_stmt = stmts.pop()
+                stmts.append(state_transition)
+                stmts.append(return_stmt)
+            else:
+                # Normal case: append state update at the end
+                stmts.append(state_transition)
+            
+            # Combine statements into block
+            block_body = Block(stmts)
             
             # Condition: _state == curr_state
             if SPECIFIC_BINOP_MODE:
@@ -1226,15 +1238,12 @@ class MatchaObfuscator:
             if value_node and isinstance(value_node, Node):
                 self.rename_variables(value_node, scope)
             
-            # Get the index expression
-            idx_node = getattr(node, 'idx', None)
-            notation = getattr(node, 'notation', None)
-            
             # For bracket notation (obj[key] or obj["key"]), rename the index expression
             # For dot notation (obj.key), do NOT rename the key - it's a member name, not a variable
             # notation can be an enum (IndexNotation.DOT/SQUARE) or an int (0/1)
-            # DOT notation = 0 or IndexNotation.DOT
-            # SQUARE/BRACKET notation = 1 or IndexNotation.SQUARE
+            notation = getattr(node, 'notation', None)
+            
+            # Detect if this is DOT notation (where we should NOT rename the idx)
             is_dot_notation = False
             if notation is not None:
                 # Handle both enum and int representations
@@ -1242,13 +1251,12 @@ class MatchaObfuscator:
                 if 'DOT' in notation_str or notation == 0:
                     is_dot_notation = True
             
+            idx_node = getattr(node, 'idx', None)
             if idx_node and isinstance(idx_node, Node):
-                if is_dot_notation:
-                    # Dot notation - don't rename the member name
-                    pass
-                else:
+                if not is_dot_notation:
                     # Bracket notation - rename variable references in the index
                     self.rename_variables(idx_node, scope)
+                # If dot notation, skip - it's a property name, not a variable
             return
 
         # 9. General Recursion for other nodes (Block, Chunk, Return, Call, etc.)
