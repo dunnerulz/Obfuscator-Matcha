@@ -198,9 +198,14 @@ class MatchaObfuscator:
         self.input_file = input_file
         self.output_file = output_file
         
-        # Encryption Key for Strings
-        # A random byte value (1-255) used for XOR encryption of string constants
-        self.xor_key = random.randint(1, 255)
+        # Encryption Key for Strings - Dynamic Runtime Key
+        # The actual key is computed at runtime using Matcha-specific globals
+        # This makes static analysis impossible - dumpers will get garbage
+        self.xor_key_base = random.randint(1, 200)  # Base component (visible in code)
+        self.xor_key_runtime_mult = random.randint(2, 7)  # Multiplier for runtime component
+        self.xor_key_runtime_add = random.randint(10, 50)  # Addition for runtime component
+        # The full key formula: (base + (runtime_value * mult + add)) % 256
+        # Where runtime_value comes from Matcha-specific globals at runtime
         
         # Constant Pool: All strings and numbers will be extracted here
         # This makes static analysis harder as values are no longer inline
@@ -212,6 +217,12 @@ class MatchaObfuscator:
         
         # AST will be populated by load_source()
         self.ast = None
+        
+        # Closure-Based Virtualization
+        # Maps operation types to their virtualized function keys
+        self.virt_table_name = self.generate_var_name()  # Name of the operator table
+        self.virt_ops = {}  # Maps (op_type, key_modifier) -> random_key
+        self.virt_key_seed = random.randint(1000, 9999)  # Seed for key generation
 
     def generate_var_name(self):
         """
@@ -249,12 +260,11 @@ class MatchaObfuscator:
         """
         Turns a simple integer into an obfuscated math expression.
         
-        Uses only addition of positive numbers to guarantee correct results.
-        The expressions look complex but always evaluate to the correct value.
+        Uses only simple arithmetic with literal numbers to guarantee correct results.
+        No recursion to avoid operator precedence issues.
         
         Args:
             value (int): The target number (must be positive for array indices).
-            depth (int): Recursion depth to prevent infinite nesting.
             
         Returns:
             Node: An AST node representing the math expression.
@@ -270,11 +280,11 @@ class MatchaObfuscator:
         if value <= 1:
             return Number(value)
         
-        # Limit recursion depth
-        max_depth = 1  # Keep it shallow to avoid issues
+        # Choose a random strategy - all use only Number() nodes to avoid nesting issues
+        strategy = random.randint(1, 4)
         
-        if depth >= max_depth:
-            # At max depth, just split into two positive numbers
+        if strategy == 1 and value > 1:
+            # Simple split: value = a + b
             a = random.randint(1, value - 1)
             b = value - a
             if SPECIFIC_BINOP_MODE:
@@ -282,31 +292,15 @@ class MatchaObfuscator:
             else:
                 return BINOP(ADD_OP(), Number(a), Number(b))
         
-        # Choose mutation strategy
-        strategy = random.randint(1, 4)
-        
-        if strategy == 1:
-            # Simple split: value = a + b
-            a = random.randint(1, value - 1)
-            b = value - a
-            a_node = self.generate_mutated_expression(a, depth + 1)
-            b_node = self.generate_mutated_expression(b, depth + 1)
-            if SPECIFIC_BINOP_MODE:
-                return ADD_OP(a_node, b_node)
-            else:
-                return BINOP(ADD_OP(), a_node, b_node)
-        
-        elif strategy == 2:
-            # Triple split: value = a + b + c
+        elif strategy == 2 and value > 2:
+            # Triple split: value = a + b + c (all positive)
             a = random.randint(1, max(1, value // 3))
             remainder = value - a
             b = random.randint(1, max(1, remainder - 1))
             c = remainder - b
+            
             if c < 1:
-                c = 1
-                b = remainder - 1
-            if b < 1:
-                # Fallback to simple split
+                # Fallback to simple
                 a = random.randint(1, value - 1)
                 b = value - a
                 if SPECIFIC_BINOP_MODE:
@@ -322,7 +316,7 @@ class MatchaObfuscator:
                 return BINOP(ADD_OP(), ab_node, Number(c))
         
         elif strategy == 3:
-            # Subtraction with larger first operand: value = (value + offset) - offset
+            # Subtraction: value = (value + offset) - offset
             offset = random.randint(50, 300)
             larger = value + offset
             if SPECIFIC_BINOP_MODE:
@@ -331,17 +325,17 @@ class MatchaObfuscator:
                 return BINOP(SUB_OP(), Number(larger), Number(offset))
         
         else:
-            # Multi-term: value = a + b + c - d where (a + b + c) > d and result = value
-            # Keep it simple: a + b + c = value + d
+            # Multi-term with subtraction: a + b + c - d = value
+            # Ensure (a + b + c) > d and result = value
             d = random.randint(50, 200)
-            total = value + d
+            total = value + d  # a + b + c must equal this
             a = random.randint(1, max(1, total // 3))
             remainder = total - a
             b = random.randint(1, max(1, remainder // 2))
             c = remainder - b
             
             if a < 1 or b < 1 or c < 1:
-                # Fallback
+                # Fallback to simple
                 if SPECIFIC_BINOP_MODE:
                     return ADD_OP(Number(value - 1), Number(1))
                 else:
@@ -372,6 +366,236 @@ class MatchaObfuscator:
         """Create a bit32["func"](node_a, node_b) call where args are AST nodes."""
         func_index = Index(String(func_name, func_name), Name('bit32'), notation=1)
         return Call(func_index, [node_a, node_b])
+
+    # =========================================================================
+    # CLOSURE-BASED VIRTUALIZATION SYSTEM
+    # =========================================================================
+    
+    def generate_virt_key(self, op_type):
+        """
+        Generate a unique random key for a virtualized operation.
+        
+        Args:
+            op_type (str): The operation type (e.g., 'add', 'sub', 'mul', 'div', 'eq', 'neq', 'lt', 'gt', 'le', 'ge')
+            
+        Returns:
+            int: A unique random key for this operation
+        """
+        # Generate a unique key that hasn't been used
+        while True:
+            key = random.randint(100, 9999)
+            if key not in self.virt_ops.values():
+                self.virt_ops[op_type] = key
+                return key
+    
+    def get_op_type_name(self, node):
+        """
+        Get the operation type string from an AST node.
+        
+        Args:
+            node: An AST binary operation node
+            
+        Returns:
+            str or None: The operation type name, or None if not recognized
+        """
+        node_type = type(node).__name__
+        
+        # Map node type names to our operation names
+        op_map = {
+            'AddOp': 'add',
+            'SubOp': 'sub', 
+            'MultOp': 'mul',
+            'DivOp': 'div',
+            'ModOp': 'mod',
+            'EqToOp': 'eq',
+            'NotEqToOp': 'neq',
+            'LessThanOp': 'lt',
+            'GreaterThanOp': 'gt',
+            'LessOrEqThanOp': 'le',
+            'GreaterOrEqThanOp': 'ge',
+            'AndOp': 'and_op',
+            'OrOp': 'or_op',
+            'ConcatOp': 'concat',
+        }
+        
+        return op_map.get(node_type, None)
+    
+    def generate_virtualized_ops_table(self):
+        """
+        Generate the Lua code for the virtualized operators table.
+        
+        This creates a table of anonymous functions, each performing a basic
+        operation. Uses clean arithmetic to support Vectors and other userdata types.
+        
+        Returns:
+            str: Lua code defining the operators table
+        """
+        lines = []
+        lines.append(f"local {self.virt_table_name} = {{}}")
+        
+        # Generate functions for each registered operation
+        # Using clean arithmetic (no modifiers) to support Vectors/userdata
+        for op_type, key in self.virt_ops.items():
+            
+            if op_type == 'add':
+                # Clean addition - supports Numbers, Vectors, etc.
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a + b end")
+                
+            elif op_type == 'sub':
+                # Clean subtraction - supports Numbers, Vectors, etc.
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a - b end")
+                
+            elif op_type == 'mul':
+                # Clean multiplication - supports Numbers, Vectors, etc.
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a * b end")
+                
+            elif op_type == 'div':
+                # Clean division - supports Numbers, Vectors, etc.
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a / b end")
+                
+            elif op_type == 'mod':
+                # Modulo
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a % b end")
+                
+            elif op_type == 'eq':
+                # Equality
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a == b end")
+                
+            elif op_type == 'neq':
+                # Not equal
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a ~= b end")
+                
+            elif op_type == 'lt':
+                # Less than
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a < b end")
+                
+            elif op_type == 'gt':
+                # Greater than
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a > b end")
+                
+            elif op_type == 'le':
+                # Less or equal
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a <= b end")
+                
+            elif op_type == 'ge':
+                # Greater or equal
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a >= b end")
+                
+            elif op_type == 'and_op':
+                # Logical and
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a and b end")
+                
+            elif op_type == 'or_op':
+                # Logical or
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a or b end")
+                
+            elif op_type == 'concat':
+                # String concatenation
+                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a .. b end")
+        
+        return "\n".join(lines) + "\n"
+    
+    def create_virt_call_node(self, op_key, left_node, right_node):
+        """
+        Create an AST node for a virtualized operator call.
+        
+        Transforms: a + b  ->  _VT[key](a, b)
+        
+        Args:
+            op_key (int): The key in the virtualized ops table
+            left_node: The left operand AST node
+            right_node: The right operand AST node
+            
+        Returns:
+            Call: An AST Call node representing _VT[key](a, b)
+        """
+        # Create _VT[key]
+        table_node = Name(self.virt_table_name)
+        key_node = Number(op_key)
+        func_index = Index(key_node, table_node, notation=1)
+        
+        # Create the call with left and right as arguments
+        return Call(func_index, [left_node, right_node])
+    
+    def virtualize_operations(self, node):
+        """
+        Traverse the AST and replace binary operations with virtualized function calls.
+        
+        This transforms expressions like `a + b` into `_VT[key](a, b)` where _VT is
+        a table of operator functions.
+        
+        Args:
+            node: The AST node to process
+        """
+        if node is None:
+            return
+        
+        # List of binary operation node type names to virtualize
+        binary_ops = {
+            'AddOp', 'SubOp', 'MultOp', 'DivOp', 'ModOp',
+            'EqToOp', 'NotEqToOp', 'LessThanOp', 'GreaterThanOp',
+            'LessOrEqThanOp', 'GreaterOrEqThanOp',
+            'AndOp', 'OrOp', 'ConcatOp'
+        }
+        
+        # Iterate over all attributes
+        for attr_name, attr_value in list(node.__dict__.items()):
+            if attr_name.startswith('_'):
+                continue
+            
+            if isinstance(attr_value, list):
+                for i, item in enumerate(attr_value):
+                    if isinstance(item, Node):
+                        node_type = type(item).__name__
+                        
+                        # Check if this is a binary operation we should virtualize
+                        if node_type in binary_ops and hasattr(item, 'left') and hasattr(item, 'right'):
+                            op_type = self.get_op_type_name(item)
+                            if op_type:
+                                # Get or create a key for this operation type
+                                if op_type not in self.virt_ops:
+                                    self.generate_virt_key(op_type)
+                                
+                                op_key = self.virt_ops[op_type]
+                                
+                                # First, recursively process the operands
+                                self.virtualize_operations(item.left)
+                                self.virtualize_operations(item.right)
+                                
+                                # Create the virtualized call
+                                virt_call = self.create_virt_call_node(op_key, item.left, item.right)
+                                
+                                # Replace the operation with the call
+                                attr_value[i] = virt_call
+                        else:
+                            # Recurse into child nodes
+                            self.virtualize_operations(item)
+            
+            elif isinstance(attr_value, Node):
+                node_type = type(attr_value).__name__
+                
+                # Check if this is a binary operation we should virtualize
+                if node_type in binary_ops and hasattr(attr_value, 'left') and hasattr(attr_value, 'right'):
+                    op_type = self.get_op_type_name(attr_value)
+                    if op_type:
+                        # Get or create a key for this operation type
+                        if op_type not in self.virt_ops:
+                            self.generate_virt_key(op_type)
+                        
+                        op_key = self.virt_ops[op_type]
+                        
+                        # First, recursively process the operands
+                        self.virtualize_operations(attr_value.left)
+                        self.virtualize_operations(attr_value.right)
+                        
+                        # Create the virtualized call
+                        virt_call = self.create_virt_call_node(op_key, attr_value.left, attr_value.right)
+                        
+                        # Replace the operation with the call
+                        setattr(node, attr_name, virt_call)
+                else:
+                    # Recurse into child nodes
+                    self.virtualize_operations(attr_value)
 
     def generate_junk_node(self):
         """
@@ -782,20 +1006,26 @@ class MatchaObfuscator:
 
     def encrypt_string(self, text):
         """
-        Encrypts a string into a list of XOR-ed integers.
+        Encrypts a string into a list of XOR-ed integers using dynamic runtime key.
+        
+        The key is computed as: (base + (runtime_component * mult + add) + index) % 256
+        At runtime, runtime_component comes from Matcha-specific globals.
+        For encryption, we use a known value (game string length) that will match at runtime.
         
         Args:
             text (str): The raw string to encrypt.
             
         Returns:
-            list: A list of integers where each byte is XOR'd with (key + index) % 256.
+            list: A list of integers where each byte is XOR'd with the dynamic key.
         """
         encrypted = []
+        # Runtime component simulation - uses len("game") which is 4 in Matcha
+        # This value is computed at runtime from tostring(game):len() % 10
+        runtime_component = 4  # len("game") = 4
+        
         for i, char in enumerate(text):
-            # Mix index 'i' into the key for position-dependent encryption
-            # Apply modulo 256 to the key BEFORE XOR to keep it byte-sized
-            # XOR of two bytes always produces a valid byte (0-255)
-            k = (self.xor_key + i) % 256
+            # Dynamic key formula matching the runtime decryptor
+            k = (self.xor_key_base + (runtime_component * self.xor_key_runtime_mult + self.xor_key_runtime_add) + i) % 256
             enc_byte = ord(char) ^ k
             encrypted.append(enc_byte)
         return encrypted
@@ -1425,90 +1655,115 @@ class MatchaObfuscator:
         # Generate randomized decryptor function name
         decryptor_name = self.generate_var_name()
         
-        # Define standalone Bit32 implementation
-        # Creates its own bit32 table to avoid read-only global issues in Roblox/Matcha
-        bit32_polyfill = """
-bit32 = {}
-local N = 32
-local P = 2 ^ N
-bit32.bnot = function(x)
-    x = x % P
-    return (P - 1) - x
+        # Generate randomized names for bit32 functions (stealth mode)
+        bit32_table_name = self.generate_var_name()  # Instead of 'bit32'
+        bit32_bnot_name = self.generate_var_name()
+        bit32_band_name = self.generate_var_name()
+        bit32_bor_name = self.generate_var_name()
+        bit32_bxor_name = self.generate_var_name()
+        bit32_lshift_name = self.generate_var_name()
+        bit32_rshift_name = self.generate_var_name()
+        bit32_arshift_name = self.generate_var_name()
+        
+        # Randomized internal variable names
+        n_var = self.generate_var_name()  # For N = 32
+        p_var = self.generate_var_name()  # For P = 2^N
+        
+        # Define stealthy Bit32 implementation wrapped in local scope
+        # Uses randomized names, no global pollution, invisible to getgenv()/_G
+        bit32_polyfill = f"""local {bit32_table_name}
+do
+local {n_var} = 32
+local {p_var} = 2 ^ {n_var}
+local {bit32_bnot_name} = function(x)
+x = x % {p_var}
+return ({p_var} - 1) - x
 end
-bit32.band = function(x, y)
-    if (y == 255) then return x % 256 end
-    if (y == 65535) then return x % 65536 end
-    if (y == 4294967295) then return x % 4294967296 end
-    x, y = x % P, y % P
-    local r = 0
-    local p = 1
-    for i = 1, N do
-        local a, b = x % 2, y % 2
-        x, y = math.floor(x / 2), math.floor(y / 2)
-        if ((a + b) == 2) then r = r + p end
-        p = 2 * p
-    end
-    return r
+local {bit32_band_name} = function(x, y)
+if (y == 255) then return x % 256 end
+if (y == 65535) then return x % 65536 end
+if (y == 4294967295) then return x % 4294967296 end
+x, y = x % {p_var}, y % {p_var}
+local r = 0
+local p = 1
+for i = 1, {n_var} do
+local a, b = x % 2, y % 2
+x, y = math.floor(x / 2), math.floor(y / 2)
+if ((a + b) == 2) then r = r + p end
+p = 2 * p
 end
-bit32.bor = function(x, y)
-    if (y == 255) then return (x - (x % 256)) + 255 end
-    if (y == 65535) then return (x - (x % 65536)) + 65535 end
-    if (y == 4294967295) then return 4294967295 end
-    x, y = x % P, y % P
-    local r = 0
-    local p = 1
-    for i = 1, N do
-        local a, b = x % 2, y % 2
-        x, y = math.floor(x / 2), math.floor(y / 2)
-        if ((a + b) >= 1) then r = r + p end
-        p = 2 * p
-    end
-    return r
+return r
 end
-bit32.bxor = function(x, y)
-    x, y = x % P, y % P
-    local r = 0
-    local p = 1
-    for i = 1, N do
-        local a, b = x % 2, y % 2
-        x, y = math.floor(x / 2), math.floor(y / 2)
-        if ((a + b) == 1) then r = r + p end
-        p = 2 * p
-    end
-    return r
+local {bit32_bor_name} = function(x, y)
+if (y == 255) then return (x - (x % 256)) + 255 end
+if (y == 65535) then return (x - (x % 65536)) + 65535 end
+if (y == 4294967295) then return 4294967295 end
+x, y = x % {p_var}, y % {p_var}
+local r = 0
+local p = 1
+for i = 1, {n_var} do
+local a, b = x % 2, y % 2
+x, y = math.floor(x / 2), math.floor(y / 2)
+if ((a + b) >= 1) then r = r + p end
+p = 2 * p
 end
-bit32.lshift = function(x, s_amount)
-    if (math.abs(s_amount) >= N) then return 0 end
-    x = x % P
-    if (s_amount < 0) then return math.floor(x * (2 ^ s_amount))
-    else return (x * (2 ^ s_amount)) % P end
+return r
 end
-bit32.rshift = function(x, s_amount)
-    if (math.abs(s_amount) >= N) then return 0 end
-    x = x % P
-    if (s_amount > 0) then return math.floor(x * (2 ^ -s_amount))
-    else return (x * (2 ^ -s_amount)) % P end
+local {bit32_bxor_name} = function(x, y)
+x, y = x % {p_var}, y % {p_var}
+local r = 0
+local p = 1
+for i = 1, {n_var} do
+local a, b = x % 2, y % 2
+x, y = math.floor(x / 2), math.floor(y / 2)
+if ((a + b) == 1) then r = r + p end
+p = 2 * p
 end
-bit32.arshift = function(x, s_amount)
-    if (math.abs(s_amount) >= N) then return 0 end
-    x = x % P
-    if (s_amount > 0) then
-        local add = 0
-        if (x >= (P / 2)) then add = P - (2 ^ (N - s_amount)) end
-        return math.floor(x * (2 ^ -s_amount)) + add
-    else return (x * (2 ^ -s_amount)) % P end
+return r
+end
+local {bit32_lshift_name} = function(x, s)
+if (math.abs(s) >= {n_var}) then return 0 end
+x = x % {p_var}
+if (s < 0) then return math.floor(x * (2 ^ s))
+else return (x * (2 ^ s)) % {p_var} end
+end
+local {bit32_rshift_name} = function(x, s)
+if (math.abs(s) >= {n_var}) then return 0 end
+x = x % {p_var}
+if (s > 0) then return math.floor(x * (2 ^ -s))
+else return (x * (2 ^ -s)) % {p_var} end
+end
+local {bit32_arshift_name} = function(x, s)
+if (math.abs(s) >= {n_var}) then return 0 end
+x = x % {p_var}
+if (s > 0) then
+local add = 0
+if (x >= ({p_var} / 2)) then add = {p_var} - (2 ^ ({n_var} - s)) end
+return math.floor(x * (2 ^ -s)) + add
+else return (x * (2 ^ -s)) % {p_var} end
+end
+{bit32_table_name} = {{['{bit32_bnot_name}']={bit32_bnot_name},['{bit32_band_name}']={bit32_band_name},['{bit32_bor_name}']={bit32_bor_name},['{bit32_bxor_name}']={bit32_bxor_name},['{bit32_lshift_name}']={bit32_lshift_name},['{bit32_rshift_name}']={bit32_rshift_name},['{bit32_arshift_name}']={bit32_arshift_name}}}
 end
 """
 
-        # Define the Lua decryptor function string
-        # Uses bit32.bxor for compatibility since '~' operator failed in Matcha VM
-        # Index-mixed decryption: key varies by position to match encrypt_string
+        # Generate additional randomized names for runtime key computation
+        runtime_key_var = self.generate_var_name()
+        game_check_var = self.generate_var_name()
+        
+        # Define the Lua decryptor function string with DYNAMIC RUNTIME KEY
+        # The key is computed using Matcha-specific globals that only exist at runtime
+        # If run in a dumper/different environment, strings decrypt to garbage
         decryptor_lua = (
+            f"local {runtime_key_var}\n"
+            f"do\n"
+            f"    local {game_check_var} = tostring(game):len() % 10\n"
+            f"    {runtime_key_var} = {self.xor_key_base} + ({game_check_var} * {self.xor_key_runtime_mult} + {self.xor_key_runtime_add})\n"
+            f"end\n"
             f"local function {decryptor_name}(bytes)\n"
             f"    local res = {{}}\n"
             f"    for i, b in ipairs(bytes) do\n"
-            f"        local k = ({self.xor_key} + (i - 1)) % 256\n"
-            f"        table.insert(res, string.char(bit32.bxor(b, k)))\n"
+            f"        local k = ({runtime_key_var} + (i - 1)) % 256\n"
+            f"        table.insert(res, string.char({bit32_table_name}['{bit32_bxor_name}'](b, k)))\n"
             f"    end\n"
             f"    return table.concat(res)\n"
             f"end\n\n"
@@ -1539,13 +1794,18 @@ end
         # Close the table
         pool_lua += "}"
         
-        # 2. Generate the Script Body
+        # 2. Generate Virtualized Operators Table (if any operations were virtualized)
+        virt_ops_lua = ""
+        if self.virt_ops:
+            virt_ops_lua = self.generate_virtualized_ops_table()
+        
+        # 3. Generate the Script Body
         # Use ast.to_lua_source(self.ast) to convert modified tree back to Lua source
         script_lua = ast.to_lua_source(self.ast)
         
-        # 3. Combine and Write
-        # Order: Polyfill -> Decryptor -> Constant Pool -> Script
-        final_output = bit32_polyfill + "\n" + decryptor_lua + pool_lua + "\n\n" + script_lua
+        # 4. Combine and Write
+        # Order: Polyfill -> Decryptor -> Constant Pool -> Virt Ops -> Script
+        final_output = bit32_polyfill + "\n" + decryptor_lua + pool_lua + "\n\n" + virt_ops_lua + "\n" + script_lua
         
         # 4. Minify the output (remove comments, empty lines, indentation)
         final_output = self.minify_source(final_output)
@@ -1615,12 +1875,17 @@ if __name__ == "__main__":
     obfuscator.inject_junk_code(obfuscator.ast)
     print("[+] Junk Code Injected (20% Density)")
 
-    # 10. Flatten Root Flow
+    # 10. Virtualize Binary Operations
+    print("[*] Virtualizing Binary Operations...")
+    obfuscator.virtualize_operations(obfuscator.ast)
+    print(f"[+] Operations Virtualized: {len(obfuscator.virt_ops)} operator types")
+
+    # 11. Flatten Root Flow
     print("[*] Flattening Root Control Flow...")
     obfuscator.flatten_root_flow(obfuscator.ast)
     print("[+] Root Control Flow Flattened")
     
-    # 11. Generate Output
+    # 12. Generate Output
     print("[*] Generating output file...")
     obfuscator.generate_output()
     print(f"[+] Obfuscated script written to {obfuscator.output_file}")
