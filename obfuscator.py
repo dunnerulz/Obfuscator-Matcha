@@ -1,13 +1,43 @@
 """
-Matcha LuaU Obfuscator
-======================
+Matcha LuaU Obfuscator (Hardened Edition v2)
+=============================================
 A performance-friendly obfuscator designed specifically for the Matcha LuaU VM.
-Focuses on making deobfuscation extremely difficult while maintaining runtime efficiency.
+Focuses on making AI-based deobfuscation extremely difficult while maintaining runtime efficiency.
 
 Key Design Principles:
 - Constant Pool: All strings and numbers are extracted and stored in a hidden table
 - Compatible with Matcha's limitations (no .Magnitude, .Unit, no task.defer/delay/cancel)
 - Optimized for high FPS execution (up to 1000fps with wait(.001))
+
+ANTI-AI DEOBFUSCATION FEATURES:
+
+1. Runtime Environment Anchoring:
+   - State keys derived from Matcha/Roblox runtime values (game.PlaceId, LocalPlayer.Name)
+   - AI cannot predict these values, halting constant folding
+
+2. Matcha-Specific Tautologies:
+   - True conditions: type(Drawing.new("Square")) == "table"
+   - False conditions: tostring(Vector3.new(1,1,1)) == "1, 1, 1" (Matcha prints address)
+   - Exploits Matcha VM quirks that AI assumes standard Roblox behavior
+
+3. Polymorphic Operator Dispatch:
+   - PolyMath(mode, a, b, salt) where mode + salt determines operation
+   - Many-to-one mapping prevents simple substitution
+   - AI cannot replace PolyMath(100, a, b, 400) with "+" without knowing salt
+
+4. Control Flow Spaghettification:
+   - Ghost States: 1-2 fake states per real state with junk code
+   - State Interleaving: Transitions happen mid-block, not just at end
+   - Creates control flow GRAPH, not simple linked list
+   - Ghost states can transition to other ghosts (cycles) or random real states
+
+5. Dynamic Opaque Predicates:
+   - Math identities: sin²+cos²=1, |sin(x)|≤1, floor(n)≤n
+   - Combined with Matcha-specific checks for layered protection
+
+6. Equivalency Mutation:
+   - select(1, value) wrappers for function call boundaries
+   - Math identities: value + 0, value * 1, math.abs(value)
 """
 
 import random
@@ -39,7 +69,7 @@ def get_statements(tree):
 
 def discover_node_classes():
     """Parses sample code to find the correct node classes for this environment."""
-    global BINOP, ADD_OP, SUB_OP, MULT_OP, DIV_OP, EQ_OP, TRUE_NODE
+    global BINOP, ADD_OP, SUB_OP, MULT_OP, DIV_OP, MOD_OP, EQ_OP, TRUE_NODE
     global NUMERIC_FOR, GENERIC_FOR, SPECIFIC_BINOP_MODE
     global ANON_FUNC
     global BXOR_OP, BAND_OP, BNOT_OP  # Bitwise operators for MBA
@@ -48,6 +78,7 @@ def discover_node_classes():
     BXOR_OP = None
     BAND_OP = None
     BNOT_OP = None
+    MOD_OP = None
     
     # 1. Discover Binary Operation Structure
     try:
@@ -67,7 +98,7 @@ def discover_node_classes():
             BINOP = type(add_node)
             ADD_OP = type(add_node.op)
             
-            # Need to re-fetch sub/mult/div classes by parsing
+            # Need to re-fetch sub/mult/div/mod classes by parsing
             sub_tree = ast.parse("local x = 1 - 1")
             SUB_OP = type(get_statements(sub_tree)[0].values[0].op)
             
@@ -76,6 +107,13 @@ def discover_node_classes():
             
             div_tree = ast.parse("local x = 1 / 1")
             DIV_OP = type(get_statements(div_tree)[0].values[0].op)
+            
+            # Discover modulo operator
+            try:
+                mod_tree = ast.parse("local x = 5 % 2")
+                MOD_OP = type(get_statements(mod_tree)[0].values[0].op)
+            except:
+                MOD_OP = SUB_OP  # Fallback
             
             if eq_node:
                 EQ_OP = type(eq_node.op)
@@ -107,6 +145,13 @@ def discover_node_classes():
             div_tree = ast.parse("local x = 1 / 1")
             DIV_OP = type(get_statements(div_tree)[0].values[0])
             
+            # Discover modulo operator
+            try:
+                mod_tree = ast.parse("local x = 5 % 2")
+                MOD_OP = type(get_statements(mod_tree)[0].values[0])
+            except:
+                MOD_OP = SUB_OP  # Fallback
+            
             if eq_node:
                 EQ_OP = type(eq_node)
             else:
@@ -117,6 +162,7 @@ def discover_node_classes():
             BINOP = getattr(astnodes, "BinOp", None)
             ADD_OP = getattr(astnodes, "Add", None)
             EQ_OP = getattr(astnodes, "Eq", None)
+            MOD_OP = getattr(astnodes, "Mod", None)
 
     except Exception as e:
         print(f"[-] Discovery Error (BinOp): {e}")
@@ -125,6 +171,7 @@ def discover_node_classes():
         BINOP = getattr(astnodes, "BinOp", None)
         ADD_OP = getattr(astnodes, "Add", None)
         EQ_OP = getattr(astnodes, "Eq", None)
+        MOD_OP = getattr(astnodes, "Mod", None)
     
     # 3. Discover True Node
     try:
@@ -165,7 +212,7 @@ def discover_node_classes():
     # Debug Output
     mode_str = "Specific (OpNode)" if SPECIFIC_BINOP_MODE else "Generic (BinOp + Op)"
     print(f"[+] AST Mode: {mode_str}")
-    print(f"[+] Auto-Discovered: Add={ADD_OP.__name__ if ADD_OP else '?'}, Eq={EQ_OP.__name__ if EQ_OP else '?'}, Anon={ANON_FUNC.__name__ if ANON_FUNC else '?'}")
+    print(f"[+] Auto-Discovered: Add={ADD_OP.__name__ if ADD_OP else '?'}, Mod={MOD_OP.__name__ if MOD_OP else '?'}, Eq={EQ_OP.__name__ if EQ_OP else '?'}, Anon={ANON_FUNC.__name__ if ANON_FUNC else '?'}")
 
 # Execute Discovery
 discover_node_classes()
@@ -223,82 +270,19 @@ class MatchaObfuscator:
         self.virt_table_name = self.generate_var_name()  # Name of the operator table
         self.virt_ops = {}  # Maps (op_type, key_modifier) -> random_key
         self.virt_key_seed = random.randint(1000, 9999)  # Seed for key generation
+
+    def _str(self, s):
+        """
+        Helper to create a String AST node with proper arguments.
+        luaparser's String() requires (s, raw) - we pass the same value for both.
         
-        # =====================================================================
-        # HYBRID REGISTER-BASED VM - Instruction Set Architecture (ISA)
-        # =====================================================================
-        # Opcodes are RANDOMIZED on every obfuscation run for anti-pattern matching
-        # Register-based design for better performance than stack-based VMs
-        
-        # Define all opcode names
-        self.vm_opcode_names = [
-            'MOV',        # R[A] = R[B] - Register move
-            'LOADK',      # R[A] = Constants[K] - Load constant (critical for strings)
-            'LOADNIL',    # R[A] = nil
-            'LOADBOOL',   # R[A] = (bool)B; if C then IP++
-            'GETGLOBAL',  # R[A] = _G[Constants[K]] - Get global (game, workspace, etc)
-            'SETGLOBAL',  # _G[Constants[K]] = R[A] - Set global
-            'GETTABLE',   # R[A] = R[B][R[C]] - Table index
-            'SETTABLE',   # R[A][R[B]] = R[C] - Table set
-            'NEWTABLE',   # R[A] = {} - Create table
-            'CALL',       # R[A](R[A+1], ..., R[A+B]) - Function call (bridge to Roblox/Matcha)
-            'RETURN',     # return R[A], ..., R[A+B] - Return values
-            'JMP',        # IP = IP + Offset - Unconditional jump
-            'JMPIF',      # if R[A] then IP = IP + Offset - Conditional jump if true
-            'JMPIFNOT',   # if not R[A] then IP = IP + Offset - Conditional jump if false
-            'EQ',         # if (R[A] == R[B]) ~= C then IP++ - Equality test
-            'LT',         # if (R[A] < R[B]) ~= C then IP++ - Less than
-            'LE',         # if (R[A] <= R[B]) ~= C then IP++ - Less or equal
-            'TEST',       # if not R[A] == C then IP++ - Boolean test
-            'FAST_ADD',   # R[A] = R[B] + R[C] - Fast addition
-            'FAST_SUB',   # R[A] = R[B] - R[C] - Fast subtraction
-            'FAST_MUL',   # R[A] = R[B] * R[C] - Fast multiplication
-            'FAST_DIV',   # R[A] = R[B] / R[C] - Fast division
-            'FAST_MOD',   # R[A] = R[B] % R[C] - Fast modulo
-            'FAST_UNM',   # R[A] = -R[B] - Unary minus
-            'FAST_NOT',   # R[A] = not R[B] - Logical not
-            'FAST_LEN',   # R[A] = #R[B] - Length operator
-            'CONCAT',     # R[A] = R[B] .. R[C] - String concatenation
-            'SELF',       # R[A+1] = R[B]; R[A] = R[B][R[C]] - Method call prep
-            'CLOSURE',    # R[A] = closure(Proto[B]) - Create closure
-            'VARARG',     # R[A], ..., R[A+B] = ... - Vararg handling
-            'FORPREP',    # R[A] -= R[A+2]; IP += B - Numeric for prep
-            'FORLOOP',    # R[A] += R[A+2]; if R[A] <= R[A+1] then IP += B; R[A+3] = R[A]
-            'TFORLOOP',   # R[A+3], ... = R[A](R[A+1], R[A+2]); if R[A+3] ~= nil then R[A+2] = R[A+3]
-            'SETLIST',    # R[A][(C-1)*50+i] = R[A+i], 1 <= i <= B
-            'NOP',        # No operation (for padding/obfuscation)
-            'YIELD',      # Yield VM execution (for wait() calls) - saves state and returns
-            'NATIVE_CALL',# Call native (non-virtualized) function by index
-            'GETUPVAL',   # R[A] = UpValues[B] - Get upvalue
-            'SETUPVAL',   # UpValues[B] = R[A] - Set upvalue
-        ]
-        
-        # Generate RANDOMIZED opcode values (shuffled every run)
-        opcode_values = list(range(1, len(self.vm_opcode_names) + 1))
-        random.shuffle(opcode_values)
-        
-        # Create the opcode mapping: name -> randomized numeric value
-        self.vm_opcodes = {}
-        for i, name in enumerate(self.vm_opcode_names):
-            self.vm_opcodes[name] = opcode_values[i]
-        
-        # Reverse mapping for VM dispatch: numeric value -> handler key
-        self.vm_opcode_reverse = {v: k for k, v in self.vm_opcodes.items()}
-        
-        # VM Register file size (R[0] to R[N-1])
-        self.vm_register_count = 64
-        
-        # VM component names (randomized)
-        self.vm_registers_name = self.generate_var_name()    # Register file table
-        self.vm_constants_name = self.generate_var_name()    # Constants table
-        self.vm_bytecode_name = self.generate_var_name()     # Bytecode array
-        self.vm_ip_name = self.generate_var_name()           # Instruction pointer
-        self.vm_dispatch_name = self.generate_var_name()     # Dispatch table
-        self.vm_execute_name = self.generate_var_name()      # Main execute function
-        
-        # Track which code sections are virtualized vs native
-        self.vm_virtualized_sections = []  # List of bytecode arrays for virtualized code
-        self.vm_hot_paths = []             # List of AST nodes to keep native
+        Args:
+            s: The string value
+            
+        Returns:
+            String: An AST String node
+        """
+        return String(s, s)
 
     def generate_var_name(self):
         """
@@ -332,1201 +316,6 @@ class MatchaObfuscator:
                 self.var_count += 1  # Keep count for stats
                 return name
 
-    # =========================================================================
-    # HYBRID REGISTER-BASED VM - Core Methods
-    # =========================================================================
-    
-    def print_opcode_mapping(self):
-        """Debug helper: Print the randomized opcode mapping."""
-        print("[*] VM Opcode Mapping (Randomized):")
-        for name, value in sorted(self.vm_opcodes.items(), key=lambda x: x[1]):
-            print(f"    {value:3d} -> {name}")
-    
-    def get_opcode(self, name):
-        """Get the randomized opcode value for an instruction name."""
-        return self.vm_opcodes.get(name, 0)
-    
-    def generate_vm_dispatch_table(self):
-        """
-        Generate the Lua code for the VM dispatch table.
-        
-        Each opcode maps to a handler function. The opcodes are randomized
-        so pattern matching against known VM structures is impossible.
-        
-        Returns:
-            str: Lua code defining the dispatch table
-        """
-        lines = []
-        
-        # Create dispatch table with randomized opcode keys
-        lines.append(f"local {self.vm_dispatch_name} = {{}}")
-        
-        # MOV: R[A] = R[B]
-        op = self.get_opcode('MOV')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B) {self.vm_registers_name}[A] = {self.vm_registers_name}[B] end")
-        
-        # LOADK: R[A] = Constants[K]
-        op = self.get_opcode('LOADK')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, K, {self.vm_constants_name}) {self.vm_registers_name}[A] = {self.vm_constants_name}[K] end")
-        
-        # LOADNIL: R[A] = nil
-        op = self.get_opcode('LOADNIL')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A) {self.vm_registers_name}[A] = nil end")
-        
-        # LOADBOOL: R[A] = (bool)B
-        op = self.get_opcode('LOADBOOL')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B) {self.vm_registers_name}[A] = B ~= 0 end")
-        
-        # GETGLOBAL: R[A] = _G[Constants[K]]
-        op = self.get_opcode('GETGLOBAL')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, K, {self.vm_constants_name}) {self.vm_registers_name}[A] = _G[{self.vm_constants_name}[K]] end")
-        
-        # SETGLOBAL: _G[Constants[K]] = R[A]
-        op = self.get_opcode('SETGLOBAL')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, K, {self.vm_constants_name}) _G[{self.vm_constants_name}[K]] = {self.vm_registers_name}[A] end")
-        
-        # GETTABLE: R[A] = R[B][R[C]]
-        op = self.get_opcode('GETTABLE')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C) {self.vm_registers_name}[A] = {self.vm_registers_name}[B][{self.vm_registers_name}[C]] end")
-        
-        # SETTABLE: R[A][R[B]] = R[C]
-        op = self.get_opcode('SETTABLE')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C) {self.vm_registers_name}[A][{self.vm_registers_name}[B]] = {self.vm_registers_name}[C] end")
-        
-        # NEWTABLE: R[A] = {}
-        op = self.get_opcode('NEWTABLE')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A) {self.vm_registers_name}[A] = {{}} end")
-        
-        # FAST_ADD: R[A] = R[B] + R[C]
-        op = self.get_opcode('FAST_ADD')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C) {self.vm_registers_name}[A] = {self.vm_registers_name}[B] + {self.vm_registers_name}[C] end")
-        
-        # FAST_SUB: R[A] = R[B] - R[C]
-        op = self.get_opcode('FAST_SUB')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C) {self.vm_registers_name}[A] = {self.vm_registers_name}[B] - {self.vm_registers_name}[C] end")
-        
-        # FAST_MUL: R[A] = R[B] * R[C]
-        op = self.get_opcode('FAST_MUL')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C) {self.vm_registers_name}[A] = {self.vm_registers_name}[B] * {self.vm_registers_name}[C] end")
-        
-        # FAST_DIV: R[A] = R[B] / R[C]
-        op = self.get_opcode('FAST_DIV')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C) {self.vm_registers_name}[A] = {self.vm_registers_name}[B] / {self.vm_registers_name}[C] end")
-        
-        # FAST_MOD: R[A] = R[B] % R[C]
-        op = self.get_opcode('FAST_MOD')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C) {self.vm_registers_name}[A] = {self.vm_registers_name}[B] % {self.vm_registers_name}[C] end")
-        
-        # FAST_UNM: R[A] = -R[B]
-        op = self.get_opcode('FAST_UNM')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B) {self.vm_registers_name}[A] = -{self.vm_registers_name}[B] end")
-        
-        # FAST_NOT: R[A] = not R[B]
-        op = self.get_opcode('FAST_NOT')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B) {self.vm_registers_name}[A] = not {self.vm_registers_name}[B] end")
-        
-        # FAST_LEN: R[A] = #R[B]
-        op = self.get_opcode('FAST_LEN')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B) {self.vm_registers_name}[A] = #{self.vm_registers_name}[B] end")
-        
-        # CONCAT: R[A] = R[B] .. R[C]
-        op = self.get_opcode('CONCAT')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C) {self.vm_registers_name}[A] = {self.vm_registers_name}[B] .. {self.vm_registers_name}[C] end")
-        
-        # EQ: Compare equality
-        op = self.get_opcode('EQ')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B) return {self.vm_registers_name}[A] == {self.vm_registers_name}[B] end")
-        
-        # LT: Less than
-        op = self.get_opcode('LT')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B) return {self.vm_registers_name}[A] < {self.vm_registers_name}[B] end")
-        
-        # LE: Less or equal
-        op = self.get_opcode('LE')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B) return {self.vm_registers_name}[A] <= {self.vm_registers_name}[B] end")
-        
-        # TEST: Boolean test
-        op = self.get_opcode('TEST')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A) return {self.vm_registers_name}[A] end")
-        
-        # JMP: Unconditional jump (handled specially in executor, but needs entry)
-        op = self.get_opcode('JMP')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function() return true end")
-        
-        # JMPIF: Jump if true (handler returns condition result)
-        op = self.get_opcode('JMPIF')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A) return {self.vm_registers_name}[A] end")
-        
-        # JMPIFNOT: Jump if false (handler returns condition result)
-        op = self.get_opcode('JMPIFNOT')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A) return not {self.vm_registers_name}[A] end")
-        
-        # RETURN: Return from VM (handled specially in executor)
-        op = self.get_opcode('RETURN')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A) return {self.vm_registers_name}[A] end")
-        
-        # CALL: R[A](R[A+1], ..., R[A+B]) - Function call
-        # This is more complex - we build args and call
-        op = self.get_opcode('CALL')
-        call_args_var = self.generate_var_name()
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C)")
-        lines.append(f"    local {call_args_var} = {{}}")
-        lines.append(f"    for i = 1, B do {call_args_var}[i] = {self.vm_registers_name}[A + i] end")
-        lines.append(f"    local results = {{{self.vm_registers_name}[A](unpack({call_args_var}))}}")
-        lines.append(f"    for i = 1, C do {self.vm_registers_name}[A + i - 1] = results[i] end")
-        lines.append(f"end")
-        
-        # SELF: R[A+1] = R[B]; R[A] = R[B][R[C]] - Method call preparation
-        op = self.get_opcode('SELF')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function({self.vm_registers_name}, A, B, C) {self.vm_registers_name}[A+1] = {self.vm_registers_name}[B]; {self.vm_registers_name}[A] = {self.vm_registers_name}[B][{self.vm_registers_name}[C]] end")
-        
-        # NOP: No operation
-        op = self.get_opcode('NOP')
-        lines.append(f"{self.vm_dispatch_name}[{op}] = function() end")
-        
-        return "\n".join(lines) + "\n"
-    
-    def generate_vm_executor(self):
-        """
-        Generate the optimized VM execution loop.
-        
-        Uses inline if/elseif for the most common opcodes to avoid
-        function call overhead. Supports YIELD for wait() handling.
-        
-        Returns:
-            str: Lua code for the VM executor function
-        """
-        # Generate randomized local variable names
-        ip_var = self.generate_var_name()
-        bc_var = self.generate_var_name()
-        k_var = self.generate_var_name()
-        r_var = self.generate_var_name()
-        op_var = self.generate_var_name()
-        a_var = self.generate_var_name()
-        b_var = self.generate_var_name()
-        c_var = self.generate_var_name()
-        state_var = self.generate_var_name()
-        native_funcs_var = self.generate_var_name()
-        
-        # Get randomized opcodes
-        OP_MOV = self.get_opcode('MOV')
-        OP_LOADK = self.get_opcode('LOADK')
-        OP_LOADNIL = self.get_opcode('LOADNIL')
-        OP_LOADBOOL = self.get_opcode('LOADBOOL')
-        OP_GETGLOBAL = self.get_opcode('GETGLOBAL')
-        OP_SETGLOBAL = self.get_opcode('SETGLOBAL')
-        OP_GETTABLE = self.get_opcode('GETTABLE')
-        OP_SETTABLE = self.get_opcode('SETTABLE')
-        OP_NEWTABLE = self.get_opcode('NEWTABLE')
-        OP_CALL = self.get_opcode('CALL')
-        OP_RETURN = self.get_opcode('RETURN')
-        OP_JMP = self.get_opcode('JMP')
-        OP_JMPIF = self.get_opcode('JMPIF')
-        OP_JMPIFNOT = self.get_opcode('JMPIFNOT')
-        OP_EQ = self.get_opcode('EQ')
-        OP_LT = self.get_opcode('LT')
-        OP_LE = self.get_opcode('LE')
-        OP_FAST_ADD = self.get_opcode('FAST_ADD')
-        OP_FAST_SUB = self.get_opcode('FAST_SUB')
-        OP_FAST_MUL = self.get_opcode('FAST_MUL')
-        OP_FAST_DIV = self.get_opcode('FAST_DIV')
-        OP_FAST_MOD = self.get_opcode('FAST_MOD')
-        OP_FAST_UNM = self.get_opcode('FAST_UNM')
-        OP_FAST_NOT = self.get_opcode('FAST_NOT')
-        OP_FAST_LEN = self.get_opcode('FAST_LEN')
-        OP_CONCAT = self.get_opcode('CONCAT')
-        OP_SELF = self.get_opcode('SELF')
-        OP_YIELD = self.get_opcode('YIELD')
-        OP_NATIVE_CALL = self.get_opcode('NATIVE_CALL')
-        OP_NOP = self.get_opcode('NOP')
-        OP_TEST = self.get_opcode('TEST')
-        
-        executor = f'''
-local {self.vm_execute_name}
-do
-    local {state_var} = {{}}
-    
-    {self.vm_execute_name} = function({bc_var}, {k_var}, {native_funcs_var})
-        local {r_var} = {state_var}.R or {{}}
-        local {ip_var} = {state_var}.IP or 1
-        local {op_var}, {a_var}, {b_var}, {c_var}
-        local _len = #{bc_var}
-        
-        while {ip_var} <= _len do
-            {op_var} = {bc_var}[{ip_var}]
-            {a_var} = {bc_var}[{ip_var}+1]
-            {b_var} = {bc_var}[{ip_var}+2]
-            {c_var} = {bc_var}[{ip_var}+3]
-            
-            -- FAST PATH: Most common opcodes first (inline for speed)
-            if {op_var} == {OP_LOADK} then
-                {r_var}[{a_var}] = {k_var}[{b_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_MOV} then
-                {r_var}[{a_var}] = {r_var}[{b_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_FAST_ADD} then
-                {r_var}[{a_var}] = {r_var}[{b_var}] + {r_var}[{c_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_FAST_SUB} then
-                {r_var}[{a_var}] = {r_var}[{b_var}] - {r_var}[{c_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_FAST_MUL} then
-                {r_var}[{a_var}] = {r_var}[{b_var}] * {r_var}[{c_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_FAST_DIV} then
-                {r_var}[{a_var}] = {r_var}[{b_var}] / {r_var}[{c_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_GETTABLE} then
-                {r_var}[{a_var}] = {r_var}[{b_var}][{r_var}[{c_var}]]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_SETTABLE} then
-                {r_var}[{a_var}][{r_var}[{b_var}]] = {r_var}[{c_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_GETGLOBAL} then
-                {r_var}[{a_var}] = _G[{k_var}[{b_var}]]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_SETGLOBAL} then
-                _G[{k_var}[{b_var}]] = {r_var}[{a_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_JMP} then
-                {ip_var} = {ip_var} + {b_var} * 4 + 4
-            elseif {op_var} == {OP_JMPIF} then
-                if {r_var}[{a_var}] then
-                    {ip_var} = {ip_var} + {b_var} * 4 + 4
-                else
-                    {ip_var} = {ip_var} + 4
-                end
-            elseif {op_var} == {OP_JMPIFNOT} then
-                if not {r_var}[{a_var}] then
-                    {ip_var} = {ip_var} + {b_var} * 4 + 4
-                else
-                    {ip_var} = {ip_var} + 4
-                end
-            elseif {op_var} == {OP_EQ} then
-                if ({r_var}[{a_var}] == {r_var}[{b_var}]) then
-                    {ip_var} = {ip_var} + 4
-                else
-                    {ip_var} = {ip_var} + 8
-                end
-            elseif {op_var} == {OP_LT} then
-                if ({r_var}[{a_var}] < {r_var}[{b_var}]) then
-                    {ip_var} = {ip_var} + 4
-                else
-                    {ip_var} = {ip_var} + 8
-                end
-            elseif {op_var} == {OP_LE} then
-                if ({r_var}[{a_var}] <= {r_var}[{b_var}]) then
-                    {ip_var} = {ip_var} + 4
-                else
-                    {ip_var} = {ip_var} + 8
-                end
-            elseif {op_var} == {OP_CALL} then
-                local _f = {r_var}[{a_var}]
-                local _args = {{}}
-                for _i = 1, {b_var} do _args[_i] = {r_var}[{a_var} + _i] end
-                local _results = {{_f(unpack(_args))}}
-                for _i = 1, {c_var} do {r_var}[{a_var} + _i - 1] = _results[_i] end
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_RETURN} then
-                {state_var}.R = nil
-                {state_var}.IP = nil
-                if {b_var} > 0 then
-                    return {r_var}[{a_var}]
-                else
-                    return nil
-                end
-            elseif {op_var} == {OP_YIELD} then
-                -- Save state and return control
-                {state_var}.R = {r_var}
-                {state_var}.IP = {ip_var} + 4
-                return "YIELD", {r_var}[{a_var}]
-            elseif {op_var} == {OP_NATIVE_CALL} then
-                -- Call native function by index (hot path optimization)
-                if {native_funcs_var} and {native_funcs_var}[{a_var}] then
-                    {r_var}[{a_var}] = {native_funcs_var}[{a_var}]()
-                end
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_LOADNIL} then
-                {r_var}[{a_var}] = nil
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_LOADBOOL} then
-                {r_var}[{a_var}] = {b_var} ~= 0
-                if {c_var} ~= 0 then {ip_var} = {ip_var} + 8 else {ip_var} = {ip_var} + 4 end
-            elseif {op_var} == {OP_NEWTABLE} then
-                {r_var}[{a_var}] = {{}}
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_FAST_MOD} then
-                {r_var}[{a_var}] = {r_var}[{b_var}] % {r_var}[{c_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_FAST_UNM} then
-                {r_var}[{a_var}] = -{r_var}[{b_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_FAST_NOT} then
-                {r_var}[{a_var}] = not {r_var}[{b_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_FAST_LEN} then
-                {r_var}[{a_var}] = #{r_var}[{b_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_CONCAT} then
-                {r_var}[{a_var}] = {r_var}[{b_var}] .. {r_var}[{c_var}]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_SELF} then
-                {r_var}[{a_var}+1] = {r_var}[{b_var}]
-                {r_var}[{a_var}] = {r_var}[{b_var}][{r_var}[{c_var}]]
-                {ip_var} = {ip_var} + 4
-            elseif {op_var} == {OP_TEST} then
-                if {r_var}[{a_var}] then
-                    {ip_var} = {ip_var} + 4
-                else
-                    {ip_var} = {ip_var} + 8
-                end
-            elseif {op_var} == {OP_NOP} then
-                {ip_var} = {ip_var} + 4
-            else
-                {ip_var} = {ip_var} + 4
-            end
-        end
-        
-        {state_var}.R = nil
-        {state_var}.IP = nil
-        return {r_var}[0]
-    end
-end
-'''
-        return executor
-    
-    def emit_instruction(self, opcode_name, a=0, b=0, c=0):
-        """
-        Create a bytecode instruction tuple.
-        
-        Args:
-            opcode_name: Name of the opcode (e.g., 'MOV', 'LOADK')
-            a, b, c: Operands (meaning depends on opcode)
-            
-        Returns:
-            tuple: (opcode, a, b, c) ready to be added to bytecode
-        """
-        return (self.get_opcode(opcode_name), a, b, c)
-    
-    def bytecode_to_lua_table(self, bytecode):
-        """
-        Convert a list of bytecode instructions to Lua table syntax.
-        
-        Args:
-            bytecode: List of instruction tuples
-            
-        Returns:
-            str: Lua table literal representing the bytecode
-        """
-        instructions = []
-        for instr in bytecode:
-            instructions.append(f"{{{instr[0]},{instr[1]},{instr[2]},{instr[3]}}}")
-        return "{" + ",".join(instructions) + "}"
-
-    # =========================================================================
-    # VIRTUALIZER - AST to Bytecode Compiler
-    # =========================================================================
-    
-    def init_virtualizer(self):
-        """
-        Initialize the virtualizer state for compilation.
-        Must be called before compile_ast.
-        """
-        # Bytecode output
-        self.vm_bytecode = []
-        
-        # VM Constants pool (separate from string encryption pool)
-        self.vm_constants_pool = []
-        
-        # Register allocation
-        self.vm_next_register = 0
-        self.vm_max_register = 0
-        
-        # Variable to register mapping: {var_name: register_index}
-        self.vm_var_registers = {}
-        
-        # Scope stack for nested blocks
-        self.vm_scope_stack = []
-        
-        # Label system for jumps
-        self.vm_labels = {}  # label_name -> instruction_index
-        self.vm_pending_jumps = []  # [(instruction_index, label_name), ...]
-        self.vm_label_counter = 0
-    
-    def vm_alloc_register(self):
-        """Allocate a new register and return its index."""
-        reg = self.vm_next_register
-        self.vm_next_register += 1
-        if self.vm_next_register > self.vm_max_register:
-            self.vm_max_register = self.vm_next_register
-        return reg
-    
-    def vm_free_register(self, count=1):
-        """Free the last N allocated registers."""
-        self.vm_next_register = max(0, self.vm_next_register - count)
-    
-    def vm_push_scope(self):
-        """Push a new variable scope."""
-        self.vm_scope_stack.append({
-            'vars': dict(self.vm_var_registers),
-            'next_reg': self.vm_next_register
-        })
-    
-    def vm_pop_scope(self):
-        """Pop a variable scope, restoring previous state."""
-        if self.vm_scope_stack:
-            scope = self.vm_scope_stack.pop()
-            self.vm_var_registers = scope['vars']
-            self.vm_next_register = scope['next_reg']
-    
-    def vm_add_constant(self, value):
-        """
-        Add a constant to the VM constants pool.
-        Returns the index of the constant.
-        """
-        if value in self.vm_constants_pool:
-            return self.vm_constants_pool.index(value)
-        self.vm_constants_pool.append(value)
-        return len(self.vm_constants_pool) - 1
-    
-    def vm_emit(self, opcode_name, a=0, b=0, c=0):
-        """
-        Emit a bytecode instruction.
-        Returns the index of the emitted instruction.
-        """
-        instr = (self.get_opcode(opcode_name), a, b, c)
-        idx = len(self.vm_bytecode)
-        self.vm_bytecode.append(instr)
-        return idx
-    
-    def vm_create_label(self):
-        """Create a new unique label name."""
-        self.vm_label_counter += 1
-        return f"_L{self.vm_label_counter}"
-    
-    def vm_set_label(self, label_name):
-        """Set a label at the current bytecode position."""
-        self.vm_labels[label_name] = len(self.vm_bytecode)
-    
-    def vm_emit_jump(self, opcode_name, label_name, a=0):
-        """
-        Emit a jump instruction to a label (resolved later).
-        """
-        idx = self.vm_emit(opcode_name, a, 0, 0)  # Offset will be patched
-        self.vm_pending_jumps.append((idx, label_name))
-        return idx
-    
-    def vm_resolve_jumps(self):
-        """
-        Resolve all pending jump offsets after compilation.
-        """
-        for instr_idx, label_name in self.vm_pending_jumps:
-            if label_name in self.vm_labels:
-                target_idx = self.vm_labels[label_name]
-                # Calculate relative offset
-                offset = target_idx - instr_idx - 1
-                # Patch the instruction
-                old_instr = self.vm_bytecode[instr_idx]
-                self.vm_bytecode[instr_idx] = (old_instr[0], old_instr[1], offset, old_instr[3])
-    
-    def compile_expression(self, node, target_reg=None):
-        """
-        Compile an expression AST node to bytecode.
-        
-        Args:
-            node: The AST expression node
-            target_reg: Optional target register (allocates one if None)
-            
-        Returns:
-            int: Register containing the result
-        """
-        if target_reg is None:
-            target_reg = self.vm_alloc_register()
-        
-        node_type = type(node).__name__
-        
-        # Number literal
-        if node_type == 'Number':
-            const_idx = self.vm_add_constant(node.n)
-            self.vm_emit('LOADK', target_reg, const_idx, 0)
-            return target_reg
-        
-        # String literal
-        elif node_type == 'String':
-            const_idx = self.vm_add_constant(node.s)
-            self.vm_emit('LOADK', target_reg, const_idx, 0)
-            return target_reg
-        
-        # Nil literal
-        elif node_type == 'Nil':
-            self.vm_emit('LOADNIL', target_reg, 0, 0)
-            return target_reg
-        
-        # Boolean literal
-        elif node_type in ('TrueExpr', 'FalseExpr'):
-            bool_val = 1 if node_type == 'TrueExpr' else 0
-            self.vm_emit('LOADBOOL', target_reg, bool_val, 0)
-            return target_reg
-        
-        # Variable reference (Name)
-        elif node_type == 'Name':
-            var_name = node.id
-            if var_name in self.vm_var_registers:
-                # Local variable - move from its register
-                src_reg = self.vm_var_registers[var_name]
-                if src_reg != target_reg:
-                    self.vm_emit('MOV', target_reg, src_reg, 0)
-                return target_reg
-            else:
-                # Global variable
-                const_idx = self.vm_add_constant(var_name)
-                self.vm_emit('GETGLOBAL', target_reg, const_idx, 0)
-                return target_reg
-        
-        # Binary operations
-        elif node_type in ('AddOp', 'SubOp', 'MultOp', 'DivOp', 'ModOp'):
-            left_reg = self.compile_expression(node.left)
-            right_reg = self.compile_expression(node.right)
-            
-            op_map = {
-                'AddOp': 'FAST_ADD',
-                'SubOp': 'FAST_SUB',
-                'MultOp': 'FAST_MUL',
-                'DivOp': 'FAST_DIV',
-                'ModOp': 'FAST_MOD'
-            }
-            self.vm_emit(op_map[node_type], target_reg, left_reg, right_reg)
-            
-            # Free temporary registers
-            if right_reg >= target_reg + 1:
-                self.vm_free_register(2)
-            return target_reg
-        
-        # Comparison operations
-        elif node_type in ('EqToOp', 'NotEqToOp', 'LessThanOp', 'GreaterThanOp', 'LessOrEqThanOp', 'GreaterOrEqThanOp'):
-            left_reg = self.compile_expression(node.left)
-            right_reg = self.compile_expression(node.right)
-            
-            # For comparisons, we use a pattern: compare, then set boolean based on result
-            if node_type == 'EqToOp':
-                self.vm_emit('EQ', left_reg, right_reg, 0)
-            elif node_type == 'NotEqToOp':
-                self.vm_emit('EQ', left_reg, right_reg, 1)  # Inverted
-            elif node_type == 'LessThanOp':
-                self.vm_emit('LT', left_reg, right_reg, 0)
-            elif node_type == 'GreaterThanOp':
-                self.vm_emit('LT', right_reg, left_reg, 0)  # Swap operands
-            elif node_type == 'LessOrEqThanOp':
-                self.vm_emit('LE', left_reg, right_reg, 0)
-            elif node_type == 'GreaterOrEqThanOp':
-                self.vm_emit('LE', right_reg, left_reg, 0)  # Swap operands
-            
-            # Result is in comparison flag, store to target
-            self.vm_emit('LOADBOOL', target_reg, 1, 1)  # true, skip next
-            self.vm_emit('LOADBOOL', target_reg, 0, 0)  # false
-            
-            return target_reg
-        
-        # Unary minus
-        elif node_type == 'UMinusOp':
-            operand_reg = self.compile_expression(node.operand)
-            self.vm_emit('FAST_UNM', target_reg, operand_reg, 0)
-            return target_reg
-        
-        # Logical not
-        elif node_type == 'NotOp':
-            operand_reg = self.compile_expression(node.operand)
-            self.vm_emit('FAST_NOT', target_reg, operand_reg, 0)
-            return target_reg
-        
-        # Length operator
-        elif node_type == 'LengthOp':
-            operand_reg = self.compile_expression(node.operand)
-            self.vm_emit('FAST_LEN', target_reg, operand_reg, 0)
-            return target_reg
-        
-        # String concatenation
-        elif node_type == 'ConcatOp':
-            left_reg = self.compile_expression(node.left)
-            right_reg = self.compile_expression(node.right)
-            self.vm_emit('CONCAT', target_reg, left_reg, right_reg)
-            return target_reg
-        
-        # Table constructor
-        elif node_type == 'Table':
-            self.vm_emit('NEWTABLE', target_reg, 0, 0)
-            
-            # Compile table fields
-            if hasattr(node, 'fields') and node.fields:
-                for i, field in enumerate(node.fields):
-                    field_type = type(field).__name__
-                    
-                    if field_type == 'Field':
-                        # key = value
-                        key_reg = self.compile_expression(field.key)
-                        val_reg = self.compile_expression(field.value)
-                        self.vm_emit('SETTABLE', target_reg, key_reg, val_reg)
-                    else:
-                        # Array-style: [i] = value
-                        idx_const = self.vm_add_constant(i + 1)
-                        idx_reg = self.vm_alloc_register()
-                        self.vm_emit('LOADK', idx_reg, idx_const, 0)
-                        val_reg = self.compile_expression(field)
-                        self.vm_emit('SETTABLE', target_reg, idx_reg, val_reg)
-            
-            return target_reg
-        
-        # Index access: table[key] or table.key
-        elif node_type == 'Index':
-            table_reg = self.compile_expression(node.value)
-            
-            if hasattr(node, 'idx'):
-                key_reg = self.compile_expression(node.idx)
-            else:
-                # Dot notation - key is a string
-                key_const = self.vm_add_constant(node.idx.id if hasattr(node.idx, 'id') else str(node.idx))
-                key_reg = self.vm_alloc_register()
-                self.vm_emit('LOADK', key_reg, key_const, 0)
-            
-            self.vm_emit('GETTABLE', target_reg, table_reg, key_reg)
-            return target_reg
-        
-        # Function call
-        elif node_type == 'Call':
-            func_reg = self.compile_expression(node.func)
-            
-            # Compile arguments
-            arg_count = 0
-            if hasattr(node, 'args') and node.args:
-                for arg in node.args:
-                    arg_reg = self.vm_alloc_register()
-                    self.compile_expression(arg, arg_reg)
-                    arg_count += 1
-            
-            # CALL: func_reg, arg_count, return_count
-            self.vm_emit('CALL', func_reg, arg_count, 1)
-            
-            # Result is in func_reg
-            if func_reg != target_reg:
-                self.vm_emit('MOV', target_reg, func_reg, 0)
-            
-            return target_reg
-        
-        # Method call: obj:method(args)
-        elif node_type == 'Invoke':
-            # Get object
-            obj_reg = self.compile_expression(node.source)
-            
-            # Get method name
-            method_const = self.vm_add_constant(node.func.id if hasattr(node.func, 'id') else str(node.func))
-            method_reg = self.vm_alloc_register()
-            self.vm_emit('LOADK', method_reg, method_const, 0)
-            
-            # SELF: prepares obj and method
-            self.vm_emit('SELF', target_reg, obj_reg, method_reg)
-            
-            # Compile arguments (obj is already at target_reg + 1)
-            arg_count = 1  # Self counts as first arg
-            if hasattr(node, 'args') and node.args:
-                for arg in node.args:
-                    arg_reg = self.vm_alloc_register()
-                    self.compile_expression(arg, arg_reg)
-                    arg_count += 1
-            
-            self.vm_emit('CALL', target_reg, arg_count, 1)
-            return target_reg
-        
-        # Logical AND
-        elif node_type == 'AndOp':
-            left_reg = self.compile_expression(node.left, target_reg)
-            
-            # If left is false, skip right evaluation
-            end_label = self.vm_create_label()
-            self.vm_emit_jump('JMPIFNOT', end_label, left_reg)
-            
-            # Evaluate right side
-            self.compile_expression(node.right, target_reg)
-            
-            self.vm_set_label(end_label)
-            return target_reg
-        
-        # Logical OR
-        elif node_type == 'OrOp':
-            left_reg = self.compile_expression(node.left, target_reg)
-            
-            # If left is true, skip right evaluation
-            end_label = self.vm_create_label()
-            self.vm_emit_jump('JMPIF', end_label, left_reg)
-            
-            # Evaluate right side
-            self.compile_expression(node.right, target_reg)
-            
-            self.vm_set_label(end_label)
-            return target_reg
-        
-        # Anonymous function
-        elif node_type in ('Function', 'AnonymousFunction'):
-            # For now, emit a placeholder - full function compilation is complex
-            # This would need to create a sub-bytecode chunk
-            self.vm_emit('LOADNIL', target_reg, 0, 0)  # Placeholder
-            return target_reg
-        
-        # Default: unknown node type
-        else:
-            # Try to handle as a generic node with a value
-            self.vm_emit('LOADNIL', target_reg, 0, 0)
-            return target_reg
-    
-    def compile_statement(self, node):
-        """
-        Compile a statement AST node to bytecode.
-        
-        Args:
-            node: The AST statement node
-        """
-        node_type = type(node).__name__
-        
-        # Local variable assignment: local x = expr
-        if node_type == 'LocalAssign':
-            for i, target in enumerate(node.targets):
-                if hasattr(target, 'id'):
-                    var_name = target.id
-                    reg = self.vm_alloc_register()
-                    self.vm_var_registers[var_name] = reg
-                    
-                    if node.values and i < len(node.values):
-                        self.compile_expression(node.values[i], reg)
-                    else:
-                        self.vm_emit('LOADNIL', reg, 0, 0)
-        
-        # Assignment: x = expr
-        elif node_type == 'Assign':
-            for i, target in enumerate(node.targets):
-                target_type = type(target).__name__
-                
-                if target_type == 'Name':
-                    var_name = target.id
-                    
-                    if var_name in self.vm_var_registers:
-                        # Local variable
-                        reg = self.vm_var_registers[var_name]
-                        if node.values and i < len(node.values):
-                            self.compile_expression(node.values[i], reg)
-                    else:
-                        # Global variable
-                        val_reg = self.vm_alloc_register()
-                        if node.values and i < len(node.values):
-                            self.compile_expression(node.values[i], val_reg)
-                        const_idx = self.vm_add_constant(var_name)
-                        self.vm_emit('SETGLOBAL', val_reg, const_idx, 0)
-                        self.vm_free_register()
-                
-                elif target_type == 'Index':
-                    # Table assignment: t[k] = v
-                    table_reg = self.compile_expression(target.value)
-                    key_reg = self.compile_expression(target.idx)
-                    val_reg = self.vm_alloc_register()
-                    if node.values and i < len(node.values):
-                        self.compile_expression(node.values[i], val_reg)
-                    self.vm_emit('SETTABLE', table_reg, key_reg, val_reg)
-        
-        # Function call statement
-        elif node_type == 'Call':
-            self.compile_expression(node)
-        
-        # Method call statement
-        elif node_type == 'Invoke':
-            self.compile_expression(node)
-        
-        # If statement
-        elif node_type == 'If':
-            else_label = self.vm_create_label()
-            end_label = self.vm_create_label()
-            
-            # Compile condition
-            cond_reg = self.compile_expression(node.test)
-            self.vm_emit_jump('JMPIFNOT', else_label, cond_reg)
-            
-            # Compile 'then' block
-            self.vm_push_scope()
-            if hasattr(node, 'body') and node.body:
-                self.compile_block(node.body)
-            self.vm_pop_scope()
-            
-            self.vm_emit_jump('JMP', end_label)
-            
-            # Compile 'else' block
-            self.vm_set_label(else_label)
-            if hasattr(node, 'orelse') and node.orelse:
-                self.vm_push_scope()
-                self.compile_block(node.orelse)
-                self.vm_pop_scope()
-            
-            self.vm_set_label(end_label)
-        
-        # While loop
-        elif node_type == 'While':
-            loop_start = self.vm_create_label()
-            loop_end = self.vm_create_label()
-            
-            self.vm_set_label(loop_start)
-            
-            # Compile condition
-            cond_reg = self.compile_expression(node.test)
-            self.vm_emit_jump('JMPIFNOT', loop_end, cond_reg)
-            
-            # Compile body
-            self.vm_push_scope()
-            if hasattr(node, 'body') and node.body:
-                self.compile_block(node.body)
-            self.vm_pop_scope()
-            
-            self.vm_emit_jump('JMP', loop_start)
-            self.vm_set_label(loop_end)
-        
-        # Repeat-until loop
-        elif node_type == 'Repeat':
-            loop_start = self.vm_create_label()
-            
-            self.vm_set_label(loop_start)
-            
-            # Compile body
-            self.vm_push_scope()
-            if hasattr(node, 'body') and node.body:
-                self.compile_block(node.body)
-            
-            # Compile condition
-            cond_reg = self.compile_expression(node.test)
-            self.vm_emit_jump('JMPIFNOT', loop_start, cond_reg)
-            self.vm_pop_scope()
-        
-        # Numeric for loop
-        elif node_type == 'Fornum':
-            # for i = start, stop, step do body end
-            loop_start = self.vm_create_label()
-            loop_end = self.vm_create_label()
-            
-            self.vm_push_scope()
-            
-            # Allocate registers for loop control
-            iter_reg = self.vm_alloc_register()
-            limit_reg = self.vm_alloc_register()
-            step_reg = self.vm_alloc_register()
-            
-            # Compile start, stop, step
-            self.compile_expression(node.start, iter_reg)
-            self.compile_expression(node.stop, limit_reg)
-            if hasattr(node, 'step') and node.step:
-                self.compile_expression(node.step, step_reg)
-            else:
-                # Default step = 1
-                const_idx = self.vm_add_constant(1)
-                self.vm_emit('LOADK', step_reg, const_idx, 0)
-            
-            # Bind loop variable
-            if hasattr(node.target, 'id'):
-                self.vm_var_registers[node.target.id] = iter_reg
-            
-            self.vm_set_label(loop_start)
-            
-            # Check condition: iter <= limit (for positive step)
-            self.vm_emit('LE', iter_reg, limit_reg, 0)
-            self.vm_emit_jump('JMPIFNOT', loop_end, iter_reg)
-            
-            # Compile body
-            if hasattr(node, 'body') and node.body:
-                self.compile_block(node.body)
-            
-            # Increment: iter = iter + step
-            self.vm_emit('FAST_ADD', iter_reg, iter_reg, step_reg)
-            self.vm_emit_jump('JMP', loop_start)
-            
-            self.vm_set_label(loop_end)
-            self.vm_pop_scope()
-        
-        # Return statement
-        elif node_type == 'Return':
-            if hasattr(node, 'values') and node.values:
-                ret_reg = self.compile_expression(node.values[0])
-                self.vm_emit('RETURN', ret_reg, 1, 0)
-            else:
-                self.vm_emit('RETURN', 0, 0, 0)
-        
-        # Break statement
-        elif node_type == 'Break':
-            # Would need loop context to know where to jump
-            # For now, emit a NOP
-            self.vm_emit('NOP', 0, 0, 0)
-        
-        # Local function
-        elif node_type == 'LocalFunction':
-            # Placeholder - full function compilation is complex
-            if hasattr(node.name, 'id'):
-                reg = self.vm_alloc_register()
-                self.vm_var_registers[node.name.id] = reg
-                self.vm_emit('LOADNIL', reg, 0, 0)
-        
-        # Do block
-        elif node_type == 'Do':
-            self.vm_push_scope()
-            if hasattr(node, 'body') and node.body:
-                self.compile_block(node.body)
-            self.vm_pop_scope()
-        
-        # Comment or other non-executable
-        elif node_type in ('Comment', 'SemiColon'):
-            pass  # Skip
-        
-        # Default: try to compile as expression
-        else:
-            try:
-                self.compile_expression(node)
-            except:
-                pass  # Skip unknown statements
-    
-    def compile_block(self, block):
-        """
-        Compile a block of statements.
-        
-        Args:
-            block: A Block node or list of statements
-        """
-        statements = block
-        
-        # Handle Block wrapper
-        if hasattr(block, 'body'):
-            statements = block.body
-        
-        if isinstance(statements, list):
-            for stmt in statements:
-                self.compile_statement(stmt)
-        else:
-            self.compile_statement(statements)
-    
-    def compile_ast(self, ast_node):
-        """
-        Compile an entire AST to bytecode.
-        
-        Args:
-            ast_node: The root AST node (usually a Chunk)
-            
-        Returns:
-            tuple: (bytecode_list, constants_list)
-        """
-        # Initialize virtualizer state
-        self.init_virtualizer()
-        
-        # Compile the AST
-        if hasattr(ast_node, 'body'):
-            self.compile_block(ast_node.body)
-        
-        # Resolve jump labels
-        self.vm_resolve_jumps()
-        
-        # Add final return if not present
-        if not self.vm_bytecode or self.vm_bytecode[-1][0] != self.get_opcode('RETURN'):
-            self.vm_emit('RETURN', 0, 0, 0)
-        
-        return (self.vm_bytecode, self.vm_constants_pool)
-    
-    def generate_vm_bytecode_table(self, bytecode):
-        """
-        Generate Lua code for the bytecode as a flat array.
-        More efficient than nested tables for large bytecode.
-        
-        Args:
-            bytecode: List of instruction tuples
-            
-        Returns:
-            str: Lua table literal
-        """
-        # Flatten to 1D array: {op1, a1, b1, c1, op2, a2, b2, c2, ...}
-        flat = []
-        for instr in bytecode:
-            flat.extend(instr)
-        
-        return "{" + ",".join(str(x) for x in flat) + "}"
-    
-    def generate_vm_constants_table(self, constants):
-        """
-        Generate Lua code for the VM constants pool.
-        
-        Args:
-            constants: List of constant values
-            
-        Returns:
-            str: Lua table literal
-        """
-        items = []
-        for const in constants:
-            if isinstance(const, str):
-                # Escape string
-                escaped = const.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
-                items.append(f'"{escaped}"')
-            elif isinstance(const, bool):
-                items.append('true' if const else 'false')
-            elif const is None:
-                items.append('nil')
-            else:
-                items.append(str(const))
-        
-        return "{" + ",".join(items) + "}"
-    
-    # =========================================================================
-    # HOT PATH DETECTION - Selective Virtualization
-    # =========================================================================
-    
-    def is_hot_path(self, node):
-        """
-        Determine if an AST node is a "hot path" that should remain native.
-        
-        Hot paths include:
-        - while true do loops (main game loops)
-        - Functions named Step, Update, Render
-        - High-frequency polling (iskeypressed, etc.)
-        - Drawing property updates
-        
-        Args:
-            node: AST node to check
-            
-        Returns:
-            bool: True if this should remain native code
-        """
-        node_type = type(node).__name__
-        
-        # Check for infinite loops: while true do
-        if node_type == 'While':
-            if hasattr(node, 'test'):
-                test_type = type(node.test).__name__
-                if test_type == 'TrueExpr':
-                    return True
-        
-        # Check for Step/Update/Render functions
-        if node_type in ('Function', 'LocalFunction'):
-            if hasattr(node, 'name'):
-                name = node.name
-                if hasattr(name, 'id'):
-                    func_name = name.id.lower()
-                    if any(hot in func_name for hot in ['step', 'update', 'render', 'draw', 'loop']):
-                        return True
-        
-        # Check for method definitions on UILib/Window
-        if node_type == 'Method':
-            if hasattr(node, 'name'):
-                method_name = str(node.name).lower()
-                if 'step' in method_name:
-                    return True
-        
-        return False
-    
-    def detect_hot_paths(self, node, hot_paths=None):
-        """
-        Walk the AST and identify all hot paths.
-        
-        Args:
-            node: Root AST node
-            hot_paths: List to collect hot path nodes (created if None)
-            
-        Returns:
-            list: List of AST nodes that are hot paths
-        """
-        if hot_paths is None:
-            hot_paths = []
-        
-        if node is None:
-            return hot_paths
-        
-        if self.is_hot_path(node):
-            hot_paths.append(node)
-        
-        # Recurse into children
-        for attr_name, attr_value in node.__dict__.items():
-            if attr_name.startswith('_'):
-                continue
-            
-            if isinstance(attr_value, list):
-                for item in attr_value:
-                    if hasattr(item, '__dict__'):
-                        self.detect_hot_paths(item, hot_paths)
-            elif hasattr(attr_value, '__dict__'):
-                self.detect_hot_paths(attr_value, hot_paths)
-        
-        return hot_paths
-    
-    def split_ast_for_virtualization(self, ast_node):
-        """
-        Split the AST into virtualized and native sections.
-        
-        Args:
-            ast_node: Root AST node
-            
-        Returns:
-            tuple: (statements_to_virtualize, hot_path_statements)
-        """
-        # Get the statements list
-        if hasattr(ast_node, 'body'):
-            body = ast_node.body
-            if hasattr(body, 'body'):
-                statements = body.body
-            else:
-                statements = body if isinstance(body, list) else [body]
-        else:
-            statements = [ast_node]
-        
-        virtualize = []
-        native = []
-        
-        for stmt in statements:
-            if self.is_hot_path(stmt):
-                native.append(stmt)
-            else:
-                virtualize.append(stmt)
-        
-        return (virtualize, native)
-    
-    def generate_hybrid_output(self, virtualized_bytecode, virtualized_constants, native_statements):
-        """
-        Generate the hybrid output with both VM code and native code.
-        
-        Args:
-            virtualized_bytecode: Bytecode for virtualized sections
-            virtualized_constants: Constants for virtualized sections
-            native_statements: AST nodes to output as native Lua
-            
-        Returns:
-            str: Combined Lua code
-        """
-        lines = []
-        
-        # Generate VM bytecode table
-        bc_name = self.generate_var_name()
-        bc_lua = self.generate_vm_bytecode_table(virtualized_bytecode)
-        lines.append(f"local {bc_name} = {bc_lua}")
-        
-        # Generate VM constants table  
-        k_name = self.generate_var_name()
-        k_lua = self.generate_vm_constants_table(virtualized_constants)
-        lines.append(f"local {k_name} = {k_lua}")
-        
-        # Generate VM executor
-        lines.append(self.generate_vm_executor())
-        
-        # Execute virtualized setup code
-        lines.append(f"local _vm_result = {self.vm_execute_name}({bc_name}, {k_name}, nil)")
-        
-        # Output native hot paths as regular Lua
-        if native_statements:
-            lines.append("-- Native hot paths (unvirtualized for performance)")
-            for stmt in native_statements:
-                try:
-                    stmt_lua = ast.to_lua_source(stmt)
-                    lines.append(stmt_lua)
-                except:
-                    pass  # Skip if conversion fails
-        
-        return "\n".join(lines)
-    
     def generate_mutated_expression(self, value, depth=0):
         """
         Turns a simple integer into an obfuscated math expression.
@@ -1637,6 +426,471 @@ end
         """Create a bit32["func"](node_a, node_b) call where args are AST nodes."""
         func_index = Index(String(func_name, func_name), Name('bit32'), notation=1)
         return Call(func_index, [node_a, node_b])
+
+    # =========================================================================
+    # EQUIVALENCY MUTATION SYSTEM
+    # =========================================================================
+    
+    def wrap_in_identity_function(self, value_node):
+        """
+        Wraps a value in an identity function call to confuse variable tracking.
+        
+        This transforms:
+            local x = 10
+        Into:
+            local x = select(1, 10)
+        
+        Why select(1, value)?
+        - select(1, ...) returns its first vararg, which is just the value itself
+        - Creates a function call boundary that confuses AI deobfuscators
+        - Uses valid, simple Lua syntax (no IIFE parentheses issues)
+        - The luaparser's to_lua_source handles this correctly
+        
+        Note: We previously used IIFEs like (function(v) return v end)(10), but
+        luaparser doesn't wrap anonymous functions in parentheses, producing
+        invalid syntax: function(v) return v end(10)
+        
+        Args:
+            value_node: The AST node representing the value to wrap
+            
+        Returns:
+            Node: A Call node wrapping the value in select(1, ...)
+        """
+        # Create: select(1, value)
+        # This is equivalent to just returning the value, but wrapped in a function call
+        select_call = Call(
+            Name('select'),
+            [Number(1), value_node]
+        )
+        
+        return select_call
+    
+    def wrap_in_complex_identity(self, value_node):
+        """
+        Alternative wrapper using math operations for numeric values.
+        
+        This transforms:
+            local x = 10
+        Into one of:
+            local x = (10 + 0)
+            local x = (10 * 1)
+            local x = math.abs(10)  -- for positive numbers
+            local x = select(1, 10)
+        
+        Args:
+            value_node: The AST node representing the value to wrap
+            
+        Returns:
+            Node: An AST node that evaluates to the same value
+        """
+        # Helper to create binary operations
+        def make_binop(op_class, left, right):
+            if SPECIFIC_BINOP_MODE:
+                return op_class(left, right)
+            else:
+                return BINOP(op_class(), left, right)
+        
+        # For Number nodes, we can use math identity operations
+        if isinstance(value_node, Number):
+            strategy = random.randint(1, 4)
+            
+            if strategy == 1:
+                # value + 0
+                return make_binop(ADD_OP, value_node, Number(0))
+            elif strategy == 2:
+                # value * 1
+                return make_binop(MULT_OP, value_node, Number(1))
+            elif strategy == 3 and value_node.n >= 0:
+                # math.abs(value) for non-negative numbers
+                # Use bracket notation: math["abs"](value)
+                return Call(
+                    Index(self._str('abs'), Name('math'), notation=1),
+                    [value_node]
+                )
+            else:
+                # select(1, value)
+                return Call(Name('select'), [Number(1), value_node])
+        
+        # For non-numbers, use select
+        return Call(Name('select'), [Number(1), value_node])
+    
+    def apply_equivalency_mutation(self, node, mutation_rate=0.3):
+        """
+        Recursively traverse AST and wrap simple values in identity expressions.
+        
+        Uses select(1, value) for general values and math identities for numbers.
+        
+        This applies to:
+        - LocalAssign values (local x = VALUE)
+        - Assign values (x = VALUE)
+        - Number and String literals in certain contexts
+        
+        Args:
+            node: The AST node to process
+            mutation_rate: Probability (0-1) of mutating each eligible value
+        """
+        if node is None:
+            return
+        
+        # Process LocalAssign
+        if isinstance(node, LocalAssign):
+            if node.values:
+                new_values = []
+                for value in node.values:
+                    # Recurse first to handle nested structures
+                    self.apply_equivalency_mutation(value, mutation_rate)
+                    
+                    # Apply mutation to simple values with probability
+                    if random.random() < mutation_rate:
+                        if isinstance(value, Number):
+                            # Use complex identity for numbers (adds math operations)
+                            new_values.append(self.wrap_in_complex_identity(value))
+                        elif isinstance(value, String):
+                            # Use select for strings
+                            new_values.append(self.wrap_in_identity_function(value))
+                        elif isinstance(value, Name):
+                            # Wrap variable references with select
+                            new_values.append(self.wrap_in_identity_function(value))
+                        else:
+                            new_values.append(value)
+                    else:
+                        new_values.append(value)
+                node.values = new_values
+            return
+        
+        # Process Assign
+        if isinstance(node, Assign):
+            if node.values:
+                new_values = []
+                for value in node.values:
+                    self.apply_equivalency_mutation(value, mutation_rate)
+                    
+                    if random.random() < mutation_rate:
+                        if isinstance(value, Number):
+                            new_values.append(self.wrap_in_complex_identity(value))
+                        elif isinstance(value, String):
+                            new_values.append(self.wrap_in_identity_function(value))
+                        else:
+                            new_values.append(value)
+                    else:
+                        new_values.append(value)
+                node.values = new_values
+            return
+        
+        # Recurse into child nodes
+        if hasattr(node, '__dict__'):
+            for attr_name, attr_value in list(node.__dict__.items()):
+                if attr_name.startswith('_'):
+                    continue
+                
+                if isinstance(attr_value, list):
+                    for item in attr_value:
+                        if isinstance(item, Node):
+                            self.apply_equivalency_mutation(item, mutation_rate)
+                
+                elif isinstance(attr_value, Node):
+                    self.apply_equivalency_mutation(attr_value, mutation_rate)
+
+    # =========================================================================
+    # RUNTIME ENVIRONMENT ANCHORING
+    # =========================================================================
+    # Uses Matcha/Roblox-specific runtime values that AI cannot predict
+    
+    def generate_runtime_key_expression(self):
+        """
+        Generates an expression that computes a key value at runtime using
+        Matcha/Roblox environment values that AI cannot predict.
+        
+        Returns:
+            tuple: (AST node for the expression, expected integer value for testing)
+        
+        Example outputs:
+        - #game:GetService("Players").LocalPlayer.Name
+        - game.PlaceId % 100
+        - #tostring(workspace)
+        """
+        strategy = random.randint(1, 5)
+        
+        # Helper to create method call: obj:Method(args)
+        def invoke(obj, method, args=None):
+            return Invoke(obj, Name(method), args or [])
+        
+        # Helper to create property access: obj["prop"] (bracket notation for safety)
+        def prop(obj, prop_name):
+            return Index(self._str(prop_name), obj, notation=1)
+        
+        # Helper for game:GetService("ServiceName")
+        def get_service(service_name):
+            return invoke(Name('game'), 'GetService', [self._str(service_name)])
+        
+        if strategy == 1:
+            # #game:GetService("Players").LocalPlayer.Name
+            # Player names are typically 3-20 chars, we use modulo for consistency
+            players = get_service("Players")
+            local_player = prop(players, 'LocalPlayer')
+            name = prop(local_player, 'Name')
+            # Wrap in length operator - we'll use ULenOp or create manually
+            # For luaparser, length is typically a UnaryOp
+            try:
+                len_tree = ast.parse("local x = #'test'")
+                len_stmts = get_statements(len_tree)
+                len_node = len_stmts[0].values[0] if len_stmts else None
+                LEN_OP = type(len_node) if len_node else None
+                if LEN_OP:
+                    expr = LEN_OP(name)
+                else:
+                    # Fallback: use string["len"](name)
+                    expr = Call(Index(self._str('len'), Name('string'), notation=1), [name])
+            except:
+                expr = Call(Index(self._str('len'), Name('string'), notation=1), [name])
+            
+            # Modulo to keep value small and predictable range
+            expr = self._make_binop(MOD_OP if 'MOD_OP' in dir() else SUB_OP, expr, Number(20))
+            estimated_value = 8  # Typical username length
+            
+        elif strategy == 2:
+            # game["PlaceId"] % 100
+            place_id = prop(Name('game'), 'PlaceId')
+            expr = self._make_binop(MOD_OP if 'MOD_OP' in dir() else SUB_OP, place_id, Number(100))
+            estimated_value = 42  # Placeholder - actual value unknown to AI
+            
+        elif strategy == 3:
+            # game["JobId"]:len() % 36  (JobIds are GUIDs, 36 chars)
+            job_id = prop(Name('game'), 'JobId')
+            len_call = invoke(job_id, 'len', [])
+            expr = self._make_binop(MOD_OP if 'MOD_OP' in dir() else SUB_OP, len_call, Number(50))
+            estimated_value = 36
+            
+        elif strategy == 4:
+            # tick() % 1000 (changes every call - highly dynamic)
+            tick_call = Call(Name('tick'), [])
+            expr = self._make_binop(MOD_OP if 'MOD_OP' in dir() else SUB_OP, tick_call, Number(1000))
+            estimated_value = 500  # Random midpoint
+            
+        else:
+            # os["time"]() % 100
+            os_time = Call(Index(self._str('time'), Name('os'), notation=1), [])
+            expr = self._make_binop(MOD_OP if 'MOD_OP' in dir() else SUB_OP, os_time, Number(100))
+            estimated_value = 50
+        
+        return expr, estimated_value
+    
+    def _make_binop(self, op_class, left, right):
+        """Helper to create binary operation respecting SPECIFIC_BINOP_MODE."""
+        if SPECIFIC_BINOP_MODE:
+            return op_class(left, right)
+        else:
+            return BINOP(op_class(), left, right)
+
+    # =========================================================================
+    # MATCHA-SPECIFIC TAUTOLOGIES (Opaque Predicates v2)
+    # =========================================================================
+    # Uses Matcha VM behavior that AI cannot predict
+    
+    def generate_matcha_tautology(self, want_true=True):
+        """
+        Generates a condition that evaluates to True or False based on
+        Matcha-specific behavior that AI cannot predict.
+        
+        Args:
+            want_true: If True, generate always-true condition. If False, always-false.
+            
+        Returns:
+            AST node representing the condition
+        
+        True conditions (tautologies):
+        - type(Drawing.new("Square")) == "table"
+        - type(game) == "userdata"
+        - typeof(workspace) == "Instance"
+        
+        False conditions (contradictions using Matcha quirks):
+        - tostring(Vector3.new(1,1,1)) == "1, 1, 1"  (Matcha prints address)
+        - task.defer ~= nil  (task.defer crashes/doesn't exist in Matcha)
+        """
+        
+        # Helper to create equality check
+        def eq_check(left, right):
+            return self._make_binop(EQ_OP, left, right)
+        
+        # Helper to create not-equal check
+        def neq_check(left, right):
+            try:
+                neq_tree = ast.parse("local x = 1 ~= 2")
+                neq_stmts = get_statements(neq_tree)
+                neq_node = neq_stmts[0].values[0] if neq_stmts else None
+                if neq_node and hasattr(neq_node, 'op'):
+                    NEQ_OP = type(neq_node.op)
+                else:
+                    NEQ_OP = type(neq_node) if neq_node else EQ_OP
+                return self._make_binop(NEQ_OP, left, right)
+            except:
+                # Fallback - negate equality
+                return self._make_binop(EQ_OP, left, right)
+        
+        if want_true:
+            # Generate always-true conditions based on Matcha behavior
+            strategy = random.randint(1, 4)
+            
+            if strategy == 1:
+                # type(Drawing.new("Square")) == "table"
+                # Use bracket notation: Drawing["new"]("Square")
+                drawing_new = Call(
+                    Index(self._str('new'), Name('Drawing'), notation=1),
+                    [self._str("Square")]
+                )
+                type_call = Call(Name('type'), [drawing_new])
+                return eq_check(type_call, self._str("table"))
+                
+            elif strategy == 2:
+                # type(game) == "userdata"
+                type_call = Call(Name('type'), [Name('game')])
+                return eq_check(type_call, self._str("userdata"))
+                
+            elif strategy == 3:
+                # typeof(workspace) == "Instance"
+                typeof_call = Call(Name('typeof'), [Name('workspace')])
+                return eq_check(typeof_call, self._str("Instance"))
+                
+            else:
+                # game:GetService("Players") ~= nil
+                # Use Invoke to create colon call: game:GetService("Players")
+                # This correctly passes 'game' as self
+                players = Invoke(
+                    Name('game'),
+                    Name('GetService'),
+                    [self._str("Players")]
+                )
+                return neq_check(players, Name('nil'))
+        
+        else:
+            # Generate always-false conditions (Matcha-specific contradictions)
+            strategy = random.randint(1, 3)
+            
+            if strategy == 1:
+                # tostring(Vector3.new(1,1,1)) == "1, 1, 1"
+                # In standard Roblox this is true, in Matcha it prints memory address
+                # Use bracket notation: Vector3["new"](1,1,1)
+                vec3 = Call(
+                    Index(self._str('new'), Name('Vector3'), notation=1),
+                    [Number(1), Number(1), Number(1)]
+                )
+                tostr = Call(Name('tostring'), [vec3])
+                return eq_check(tostr, self._str("1, 1, 1"))
+                
+            elif strategy == 2:
+                # task.defer ~= nil (task.defer doesn't work in Matcha)
+                # Use bracket notation: task["defer"]
+                task_defer = Index(self._str('defer'), Name('task'), notation=1)
+                return neq_check(task_defer, Name('nil'))
+                
+            else:
+                # Vector3.new(1,0,0).Unit ~= nil (.Unit doesn't exist in Matcha)
+                # Use bracket notation: Vector3["new"](1,0,0)["Unit"]
+                vec3 = Call(
+                    Index(self._str('new'), Name('Vector3'), notation=1),
+                    [Number(1), Number(0), Number(0)]
+                )
+                unit_prop = Index(self._str('Unit'), vec3, notation=1)
+                return neq_check(unit_prop, Name('nil'))
+
+    # =========================================================================
+    # POLYMORPHIC OPERATOR DISPATCH
+    # =========================================================================
+    # Many-to-one mapping with salt values to prevent simple substitution
+    
+    def generate_polymorphic_ops_table(self):
+        """
+        Generate a polymorphic operator dispatch system.
+        
+        Instead of simple Ops[1] = add, we use:
+        PolyMath(mode, a, b, salt) where mode + salt determines operation
+        
+        Returns:
+            str: Lua code defining the polymorphic dispatch function
+        """
+        func_name = self.generate_var_name()
+        self.poly_dispatch_name = func_name
+        
+        # Generate random base values for each operation
+        # The formula is: if (mode + salt) == target then return operation
+        self.poly_targets = {
+            'add': random.randint(500, 599),
+            'sub': random.randint(600, 699),
+            'mul': random.randint(700, 799),
+            'div': random.randint(800, 899),
+            'mod': random.randint(900, 999),
+            'eq': random.randint(1000, 1099),
+            'neq': random.randint(1100, 1199),
+            'lt': random.randint(1200, 1299),
+            'gt': random.randint(1300, 1399),
+            'le': random.randint(1400, 1499),
+            'ge': random.randint(1500, 1599),
+            'concat': random.randint(1600, 1699),
+        }
+        
+        # Build the function with randomized order
+        lines = [f"local {func_name} = function(mode, a, b, salt)"]
+        lines.append("    local t = mode + salt")
+        
+        # Shuffle the operations for non-obvious ordering
+        ops_list = list(self.poly_targets.items())
+        random.shuffle(ops_list)
+        
+        for op_type, target in ops_list:
+            if op_type == 'add':
+                lines.append(f"    if t == {target} then return a + b end")
+            elif op_type == 'sub':
+                lines.append(f"    if t == {target} then return a - b end")
+            elif op_type == 'mul':
+                lines.append(f"    if t == {target} then return a * b end")
+            elif op_type == 'div':
+                lines.append(f"    if t == {target} then return a / b end")
+            elif op_type == 'mod':
+                lines.append(f"    if t == {target} then return a % b end")
+            elif op_type == 'eq':
+                lines.append(f"    if t == {target} then return a == b end")
+            elif op_type == 'neq':
+                lines.append(f"    if t == {target} then return a ~= b end")
+            elif op_type == 'lt':
+                lines.append(f"    if t == {target} then return a < b end")
+            elif op_type == 'gt':
+                lines.append(f"    if t == {target} then return a > b end")
+            elif op_type == 'le':
+                lines.append(f"    if t == {target} then return a <= b end")
+            elif op_type == 'ge':
+                lines.append(f"    if t == {target} then return a >= b end")
+            elif op_type == 'concat':
+                lines.append(f"    if t == {target} then return a .. b end")
+        
+        # Add decoy/junk conditions
+        for _ in range(3):
+            fake_target = random.randint(100, 499)
+            fake_result = random.choice(['nil', '0', 'false', 'a'])
+            lines.append(f"    if t == {fake_target} then return {fake_result} end")
+        
+        lines.append("    return nil")
+        lines.append("end")
+        
+        return "\n".join(lines) + "\n"
+    
+    def get_poly_call_params(self, op_type):
+        """
+        Get the (mode, salt) pair for a polymorphic operation call.
+        
+        Args:
+            op_type: The operation type string
+            
+        Returns:
+            tuple: (mode, salt) where mode + salt == target for this operation
+        """
+        if not hasattr(self, 'poly_targets') or op_type not in self.poly_targets:
+            return None, None
+            
+        target = self.poly_targets[op_type]
+        # Split target into mode + salt randomly
+        salt = random.randint(100, 400)
+        mode = target - salt
+        return mode, salt
 
     # =========================================================================
     # CLOSURE-BASED VIRTUALIZATION SYSTEM
@@ -1868,40 +1122,198 @@ end
                     # Recurse into child nodes
                     self.virtualize_operations(attr_value)
 
+    def generate_opaque_predicate(self):
+        """
+        Generates an opaque predicate - a condition that is mathematically always false
+        but appears complex to static analysis and AI deobfuscators.
+        
+        Returns a tuple of (condition_node, complexity_score) where higher scores
+        indicate more complex predicates.
+        """
+        predicate_type = random.randint(1, 6)
+        num = random.randint(1, 1000)
+        num2 = random.randint(1, 1000)
+        
+        # Helper to create math["func"](arg) call
+        # Use bracket notation with string key for reliable output
+        def math_call(func_name, *args):
+            return Call(
+                Index(self._str(func_name), Name('math'), notation=1),  # Creates math["func_name"]
+                list(args)
+            )
+        
+        # Helper to create binary operation
+        def make_binop(op_class, left, right):
+            if SPECIFIC_BINOP_MODE:
+                return op_class(left, right)
+            else:
+                return BINOP(op_class(), left, right)
+        
+        # Discover comparison operators dynamically
+        try:
+            gt_tree = ast.parse("local x = 1 > 1")
+            gt_stmts = get_statements(gt_tree)
+            gt_node = gt_stmts[0].values[0] if gt_stmts else None
+            GT_OP = type(gt_node.op) if gt_node and hasattr(gt_node, 'op') else type(gt_node)
+                
+            lt_tree = ast.parse("local x = 1 < 1")
+            lt_stmts = get_statements(lt_tree)
+            lt_node = lt_stmts[0].values[0] if lt_stmts else None
+            LT_OP = type(lt_node.op) if lt_node and hasattr(lt_node, 'op') else type(lt_node)
+            
+            mod_tree = ast.parse("local x = 5 % 2")
+            mod_stmts = get_statements(mod_tree)
+            mod_node = mod_stmts[0].values[0] if mod_stmts else None
+            MOD_OP = type(mod_node.op) if mod_node and hasattr(mod_node, 'op') else type(mod_node)
+        except:
+            GT_OP = EQ_OP
+            LT_OP = EQ_OP
+            MOD_OP = SUB_OP
+        
+        complexity = 1
+        condition = None
+        
+        try:
+            if predicate_type == 1:
+                # math.abs(math.sin(n)) > 2  -- Always false (sin in [-1,1])
+                sin_call = math_call('sin', Number(num))
+                abs_call = math_call('abs', sin_call)
+                condition = make_binop(GT_OP, abs_call, Number(2))
+                complexity = 2
+                
+            elif predicate_type == 2:
+                # math.sin(n)^2 + math.cos(n)^2 > 1.5  -- Always false (Pythagorean identity = 1)
+                sin_sq = math_call('pow', math_call('sin', Number(num)), Number(2))
+                cos_sq = math_call('pow', math_call('cos', Number(num)), Number(2))
+                sum_expr = make_binop(ADD_OP, sin_sq, cos_sq)
+                condition = make_binop(GT_OP, sum_expr, Number(1.5))
+                complexity = 4
+                
+            elif predicate_type == 3:
+                # math.floor(n) > n + 1  -- Always false (floor(n) <= n)
+                floor_call = math_call('floor', Number(num))
+                num_plus_1 = make_binop(ADD_OP, Number(num), Number(1))
+                condition = make_binop(GT_OP, floor_call, num_plus_1)
+                complexity = 2
+                
+            elif predicate_type == 4:
+                # (n % 1) > 0.5 for integer n  -- Always false (int % 1 == 0)
+                mod_expr = make_binop(MOD_OP, Number(num), Number(1))
+                condition = make_binop(GT_OP, mod_expr, Number(0.5))
+                complexity = 2
+                
+            elif predicate_type == 5:
+                # math.abs(n) < -1  -- Always false (abs is never negative)
+                abs_call = math_call('abs', Number(num))
+                neg_one = make_binop(SUB_OP, Number(0), Number(1))
+                condition = make_binop(LT_OP, abs_call, neg_one)
+                complexity = 2
+                
+            elif predicate_type == 6:
+                # math.exp(n) < 0  -- Exponential is always positive
+                exp_call = math_call('exp', Number(num % 10))  # Keep small to avoid overflow
+                condition = make_binop(LT_OP, exp_call, Number(0))
+                complexity = 2
+                
+        except Exception:
+            pass
+        
+        # Fallback if condition creation failed
+        if condition is None:
+            num2 = random.randint(100, 999)
+            while num == num2:
+                num2 = random.randint(100, 999)
+            condition = make_binop(EQ_OP, Number(num), Number(num2))
+            complexity = 1
+            
+        return condition, complexity
+
     def generate_junk_node(self):
         """
         Creates a 'junk' control flow block (If statement) that serves as obfuscation noise.
-        Uses simple number comparisons that are always false, avoiding constant pool dependencies.
+        
+        Uses THREE types of opaque predicates:
+        1. Math-based (sin²+cos²=1, |sin(x)|≤1) - 40% chance
+        2. Matcha-specific contradictions (Vector3 tostring, task.defer) - 40% chance
+        3. Runtime environment checks that AI can't evaluate - 20% chance
+        
+        The body contains meaningful-looking but dead code.
         """
         if not EQ_OP:
             return None 
         
-        # Generate two different random numbers for a condition that's always false
-        num1 = random.randint(100, 999)
-        num2 = random.randint(100, 999)
-        while num1 == num2:
-            num2 = random.randint(100, 999)
-
-        # Create Condition: num1 == num2 (always false since they're different)
-        left = Number(num1)
-        right = Number(num2)
-             
-        if SPECIFIC_BINOP_MODE:
-            condition = EQ_OP(left, right)
+        # Choose predicate type
+        predicate_choice = random.random()
+        
+        if predicate_choice < 0.4:
+            # Math-based opaque predicate (always false)
+            condition, _ = self.generate_opaque_predicate()
+        elif predicate_choice < 0.8:
+            # Matcha-specific contradiction (always false in Matcha)
+            try:
+                condition = self.generate_matcha_tautology(want_true=False)
+            except:
+                condition, _ = self.generate_opaque_predicate()
         else:
-            condition = BINOP(EQ_OP(), left, right)
+            # Complex runtime check that evaluates to false
+            # We use a tautology wrapped in a negation-like construct
+            try:
+                # Create: not (type(game) == "userdata") -- always false since it IS userdata
+                inner = self.generate_matcha_tautology(want_true=True)
+                # Wrap in "not" by checking == false
+                condition = self._make_binop(EQ_OP, inner, Name('false'))
+            except:
+                condition, _ = self.generate_opaque_predicate()
 
-        # Create Body: while true do break end
+        # Create Body: Complex junk that looks meaningful
+        junk_type = random.randint(1, 5)
+        
         if TRUE_NODE:
             true_node = TRUE_NODE()
         else:
             true_node = Name('true')
         
-        loop_body = Block([Break()])
-        while_loop = While(true_node, loop_body)
+        if junk_type == 1:
+            # while true do break end
+            loop_body = Block([Break()])
+            junk_body = Block([While(true_node, loop_body)])
+            
+        elif junk_type == 2:
+            # Nested dead assignment with math operation
+            junk_var = self.generate_var_name()
+            dead_assign = LocalAssign(
+                [Name(junk_var)],
+                [self._make_binop(ADD_OP, Number(random.randint(1,100)), Number(random.randint(1,100)))]
+            )
+            junk_body = Block([dead_assign])
+            
+        elif junk_type == 3:
+            # repeat until true (dead code)
+            repeat_body = Block([Break()])
+            junk_body = Block([Repeat(repeat_body, true_node)])
+            
+        elif junk_type == 4:
+            # Fake API call that looks real
+            junk_var = self.generate_var_name()
+            # game:GetService("SomeService") - looks like real code
+            # Use Invoke to create colon call: game:GetService("ServiceName")
+            fake_service = Invoke(
+                Name('game'),
+                Name('GetService'),
+                [self._str(random.choice(["RunService", "Players", "Lighting", "ReplicatedStorage"]))]
+            )
+            dead_assign = LocalAssign([Name(junk_var)], [fake_service])
+            junk_body = Block([dead_assign])
+            
+        else:
+            # Nested if with another false condition
+            inner_condition, _ = self.generate_opaque_predicate()
+            inner_var = self.generate_var_name()
+            inner_assign = LocalAssign([Name(inner_var)], [Number(0)])
+            inner_if = If(inner_condition, Block([inner_assign]), [])
+            junk_body = Block([inner_if])
         
-        # Return If(condition, Block([while_loop]), [])
-        return If(condition, Block([while_loop]), [])
+        return If(condition, junk_body, [])
 
     def convert_method_calls(self, node):
         """
@@ -2012,8 +1424,16 @@ end
 
     def flatten_root_flow(self, node):
         """
-        Flattens the control flow of the root chunk using a state machine.
-        This restructures sequential code into a while-loop switch statement.
+        Flattens the control flow of the root chunk using an ADVANCED state machine.
+        
+        SPAGHETTIFICATION FEATURES:
+        1. Ghost States: For each real state, generate 1-2 fake states with junk code
+        2. State Interleaving: State transitions can happen mid-block, not just at end
+        3. Runtime Key Anchoring: Key derived from Matcha environment (game.PlaceId, etc.)
+        4. Relative Transitions: 70% use offsets instead of absolute values
+        5. Conditional Multi-Transitions: Some states have multiple exit paths
+        
+        This creates a control flow GRAPH, not a simple linked list.
         """
         # Ensure node has a body (is a Chunk or Block)
         if not hasattr(node, 'body') or not node.body:
@@ -2030,194 +1450,235 @@ end
              return
 
         # Handle Block wrapping (Chunk -> Block -> List)
-        # luaparser Chunk.body is usually a Block object. Block.body is the list.
         statements_list = node.body
         if isinstance(node.body, Block):
             statements_list = node.body.body
         
-        # Safety check: ensure we have a list to iterate
         if not isinstance(statements_list, list):
             return
 
         # ---------------------------------------------------------------------
         # PRE-PASS: Hoist Local Definitions
-        # We must move all root-level local definitions (LocalAssign, LocalFunction)
-        # to the very top, outside the state machine loop. Otherwise, variables defined
-        # in State 1 will be out of scope (nil) in State 2.
         # ---------------------------------------------------------------------
         hoisted_names = []
         new_statements_list = []
         
         for stmt in statements_list:
             if isinstance(stmt, LocalAssign):
-                # Collect names to hoist
                 for target in stmt.targets:
                     if isinstance(target, Name):
-                        # Create a new Name node for the declaration to avoid reference issues
                         hoisted_names.append(Name(target.id))
-                
-                # Convert definition to assignment: local x = 1 -> x = 1
-                # If there are values, we keep the assignment.
                 if stmt.values:
                     new_stmt = Assign(stmt.targets, stmt.values)
                     new_statements_list.append(new_stmt)
-                # If "local x" (no values), we just remove the statement as hoisting handles the declaration
-                
+                    
             elif isinstance(stmt, LocalFunction):
-                # Hoist function name
                 if isinstance(stmt.name, Name):
                     hoisted_names.append(Name(stmt.name.id))
-                    
-                    # Convert: local function f() end -> f = function() end
-                    # Use discovered ANON_FUNC class
                     if ANON_FUNC:
                         anon_func = ANON_FUNC(stmt.args, stmt.body)
                         new_stmt = Assign([stmt.name], [anon_func])
                         new_statements_list.append(new_stmt)
                     else:
-                        # Fallback if discovery failed: keep original stmt (won't be flattened correctly but avoids crash)
                         new_statements_list.append(stmt)
                 else:
                     new_statements_list.append(stmt)
             else:
                 new_statements_list.append(stmt)
 
-        # Update statements_list to the version where locals are converted to assignments
         statements_list = new_statements_list
 
         # Step A: Chunking
-        # Group statements into small blocks or isolated functions
         chunks = []
         current_chunk = []
         
         for stmt in statements_list:
-            # We treat functions as atomic chunks
-            if isinstance(stmt, Function): # Note: LocalFunctions are now Assigns containing Functions
+            if isinstance(stmt, Function):
                 if current_chunk:
                     chunks.append(current_chunk)
                     current_chunk = []
                 chunks.append([stmt])
             else:
                 current_chunk.append(stmt)
-                # Group 2-3 statements per chunk for the control flow
                 if len(current_chunk) >= 3:
                     chunks.append(current_chunk)
                     current_chunk = []
         
-        # Append any remaining statements
         if current_chunk:
             chunks.append(current_chunk)
 
-        # If there are no chunks or just one, flattening adds overhead without much benefit
-        # But we proceed if > 0 to test functionality
         if not chunks:
             return
 
-        # Step B: State Assignment
-        # Assign a random unique ID to each chunk
-        available_states = list(range(1000, 9999))
-        random.shuffle(available_states)
+        # =====================================================================
+        # ADVANCED STATE MACHINE WITH GHOST STATES & SPAGHETTIFICATION
+        # =====================================================================
         
-        chunk_states = []
-        for _ in chunks:
-            if not available_states:
-                # Fallback if we run out of unique states (unlikely for root)
-                available_states = list(range(10000, 20000))
-            chunk_states.append(available_states.pop())
-            
-        start_state = chunk_states[0]
-        end_state = -1
-
-        # Step C: Build the Dispatcher (Control Flow Graph)
-        state_var_name = "_state"
+        # Helper for binary operations
+        def make_binop(op_class, left, right):
+            if SPECIFIC_BINOP_MODE:
+                return op_class(left, right)
+            else:
+                return BINOP(op_class(), left, right)
+        
+        # Generate variable names
+        state_var_name = self.generate_var_name()
+        state_key_name = self.generate_var_name()
         state_var = Name(state_var_name)
+        key_var = Name(state_key_name)
         
-        # 1. Initial Assignment: local _state = start_state
-        init_assign = LocalAssign([Name(state_var_name)], [Number(start_state)])
+        # Generate state values with gaps for ghost states
+        base_state = random.randint(100, 300)
+        state_gap = random.randint(50, 100)  # Gap between consecutive real states
+        
+        # Real states
+        real_states = []
+        current_state = base_state
+        for i in range(len(chunks)):
+            real_states.append(current_state)
+            current_state += state_gap + random.randint(-10, 20)
+        
+        # Generate GHOST STATES (fake states with junk code)
+        ghost_states = []
+        all_used_states = set(real_states)
+        
+        for real_state in real_states:
+            # 1-2 ghost states per real state
+            num_ghosts = random.randint(1, 2)
+            for _ in range(num_ghosts):
+                # Generate a ghost state value near the real state
+                ghost = real_state + random.randint(-30, 30)
+                while ghost in all_used_states or ghost < 0:
+                    ghost = real_state + random.randint(-30, 30)
+                ghost_states.append(ghost)
+                all_used_states.add(ghost)
+        
+        start_state = real_states[0]
+        end_state = -1
+        state_key = random.randint(100, 500)
 
-        # 2. Construct the If-ElseIf Chain
-        # We build this backwards to nest the 'Else' blocks correctly.
-        # The base case is the termination check: if _state == -1 then break end
+        # Build the If-ElseIf dispatch chain
+        # Start with termination condition
+        final_cond = make_binop(EQ_OP, state_var, Number(end_state))
+        dispatch_chain = If(final_cond, Block([Break()]), [])
         
-        # Build Base Condition
-        if SPECIFIC_BINOP_MODE:
-            final_cond = EQ_OP(state_var, Number(end_state))
-        else:
-            final_cond = BINOP(EQ_OP(), state_var, Number(end_state))
-
-        dispatch_chain = If(
-            final_cond,
-            Block([Break()]),
-            [] # Empty else block for the final check
-        )
+        # Add GHOST STATE handlers (junk code that looks real)
+        random.shuffle(ghost_states)
+        for ghost in ghost_states:
+            # Generate junk code for this ghost state
+            junk_stmts = []
+            
+            # Add some fake computation
+            junk_var = self.generate_var_name()
+            junk_stmts.append(LocalAssign(
+                [Name(junk_var)],
+                [make_binop(ADD_OP, Number(random.randint(1, 100)), Number(random.randint(1, 100)))]
+            ))
+            
+            # Ghost state transitions to another ghost or loops back
+            if random.random() < 0.5 and len(ghost_states) > 1:
+                # Transition to another ghost state (creates cycles)
+                other_ghost = random.choice([g for g in ghost_states if g != ghost])
+                junk_stmts.append(Assign([Name(state_var_name)], [Number(other_ghost)]))
+            else:
+                # Transition to a random real state (breaks the pattern)
+                random_real = random.choice(real_states)
+                junk_stmts.append(Assign([Name(state_var_name)], [Number(random_real)]))
+            
+            ghost_body = Block(junk_stmts)
+            
+            # Condition for ghost state - use various comparison styles
+            if random.random() < 0.5:
+                ghost_cond = make_binop(EQ_OP, state_var, Number(ghost))
+            else:
+                # Key-based comparison
+                state_minus_key = make_binop(SUB_OP, state_var, key_var)
+                ghost_cond = make_binop(EQ_OP, state_minus_key, Number(ghost - state_key))
+            
+            dispatch_chain = If(ghost_cond, ghost_body, [dispatch_chain])
         
-        # Iterate backwards through chunks
+        # Add REAL STATE handlers (actual code)
+        # Process backwards for correct nesting
         for i in range(len(chunks) - 1, -1, -1):
-            curr_state = chunk_states[i]
+            curr_state = real_states[i]
             
             # Determine next state
             if i < len(chunks) - 1:
-                next_state = chunk_states[i+1]
+                next_state = real_states[i + 1]
+                offset_to_next = next_state - curr_state
             else:
                 next_state = end_state
+                offset_to_next = None
+            
+            stmts = list(chunks[i])
+            
+            # STATE INTERLEAVING: Sometimes put transition in middle of block
+            use_interleaved = random.random() < 0.3 and len(stmts) > 1
+            
+            if use_interleaved and offset_to_next is not None:
+                # Insert state transition in the MIDDLE of the block
+                insert_pos = random.randint(1, len(stmts))
                 
-            # Prepare Block: Statements + State Transition
-            stmts = list(chunks[i])  # Make a copy to avoid modifying original
-            # Add state transition: _state = next_state
-            # Note: This is a normal Assign, not LocalAssign, as it updates the existing var
-            state_transition = Assign([Name(state_var_name)], [Number(next_state)])
-            
-            # CRITICAL FIX: Check if the last statement is a Return
-            # In Lua, 'return' must be the last statement in a block
-            # So we insert the state transition BEFORE the return, not after
-            if stmts and isinstance(stmts[-1], Return):
-                # Pop return, add state transition, put return back
-                return_stmt = stmts.pop()
-                stmts.append(state_transition)
-                stmts.append(return_stmt)
+                # Use relative transition
+                offset_expr = make_binop(ADD_OP, state_var, Number(offset_to_next))
+                state_transition = Assign([Name(state_var_name)], [offset_expr])
+                stmts.insert(insert_pos, state_transition)
             else:
-                # Normal case: append state update at the end
-                stmts.append(state_transition)
+                # Normal: transition at end
+                use_relative = random.random() < 0.7
+                
+                if use_relative and offset_to_next is not None:
+                    offset_expr = make_binop(ADD_OP, state_var, Number(offset_to_next))
+                    state_transition = Assign([Name(state_var_name)], [offset_expr])
+                else:
+                    state_transition = Assign([Name(state_var_name)], [Number(next_state)])
+                
+                # Handle return statements
+                if stmts and isinstance(stmts[-1], Return):
+                    return_stmt = stmts.pop()
+                    stmts.append(state_transition)
+                    stmts.append(return_stmt)
+                else:
+                    stmts.append(state_transition)
             
-            # Combine statements into block
             block_body = Block(stmts)
             
-            # Condition: _state == curr_state
-            if SPECIFIC_BINOP_MODE:
-                condition = EQ_OP(state_var, Number(curr_state))
+            # Create condition with variety
+            cond_style = random.randint(1, 3)
+            
+            if cond_style == 1:
+                # Direct: _state == curr_state
+                condition = make_binop(EQ_OP, state_var, Number(curr_state))
+            elif cond_style == 2:
+                # Key-based: (_state - _key) == (curr_state - state_key)
+                state_minus_key = make_binop(SUB_OP, state_var, key_var)
+                condition = make_binop(EQ_OP, state_minus_key, Number(curr_state - state_key))
             else:
-                condition = BINOP(EQ_OP(), state_var, Number(curr_state))
+                # Key-offset: _state == (_key + offset)
+                key_plus_offset = make_binop(ADD_OP, key_var, Number(curr_state - state_key))
+                condition = make_binop(EQ_OP, state_var, key_plus_offset)
             
-            # Wrap in If node
-            # The previous chain becomes the 'Else' block of this new If node
-            # This creates the effect of: if ... then ... else if ... then ...
             dispatch_chain = If(condition, block_body, [dispatch_chain])
-            
-        # 3. Create the Loop: while true do [dispatch_chain] end
         
-        # Check if TRUE_NODE is a class (callable) or just None
+        # Create the main loop
         if TRUE_NODE:
             true_node = TRUE_NODE()
         else:
-            # Fallback to a Name node 'true' which Lua treats as the boolean true
             true_node = Name('true')
             
         loop_node = While(true_node, Block([dispatch_chain]))
         
-        # Step D: Replacement
+        # Build final body
+        key_init = LocalAssign([Name(state_key_name)], [Number(state_key)])
+        state_init = LocalAssign([Name(state_var_name)], [Number(start_state)])
         
-        # Final Body construction:
-        # 1. Hoisted Declarations (local a, b, c)
-        # 2. State Init (local _state = ...)
-        # 3. Loop
-        
-        final_body = [init_assign, loop_node]
+        final_body = [key_init, state_init, loop_node]
         
         if hoisted_names:
-            hoist_decl = LocalAssign(hoisted_names, []) # local a, b, c
+            hoist_decl = LocalAssign(hoisted_names, [])
             final_body.insert(0, hoist_decl)
             
-        # Replace the original root body with our State Machine structure
+        # Replace the original root body
         if isinstance(node.body, Block):
             node.body.body = final_body
         else:
@@ -2227,12 +1688,44 @@ end
         """
         Recursively traverse the AST and inject junk code into statement lists.
         
+        SAFETY: Only injects into 'body' attributes which contain statement lists.
+        Never injects into:
+        - 'values' (assignment RHS)
+        - 'args' (function arguments)
+        - 'targets' (assignment LHS)
+        - 'iters'/'iterators' (for loop iterators)
+        - 'condition' (if/while conditions)
+        
         Args:
             node: The current AST node.
             is_root (bool): True if this is the top-level node (Chunk).
         """
         if node is None:
             return
+
+        # List of attribute names that are SAFE to inject statements into
+        # These are statement blocks, not expression lists
+        SAFE_INJECTION_ATTRS = {'body'}
+        
+        # List of attribute names we should NEVER inject into
+        # These are expression contexts where statements are invalid
+        UNSAFE_ATTRS = {
+            'values',      # Assignment RHS: local x = [values]
+            'args',        # Function call arguments
+            'targets',     # Assignment LHS
+            'iters',       # For loop iterators
+            'iterators',   # Alternative name for iterators
+            'iter',        # Single iterator
+            'condition',   # If/while conditions
+            'test',        # Alternative condition name
+            'idx',         # Index expressions
+            'value',       # Single value expressions
+            'start',       # For loop start
+            'stop',        # For loop stop  
+            'step',        # For loop step
+            'func',        # Function being called
+            'source',      # Table source in index
+        }
 
         # Iterate over all attributes of the node
         # We use list(items) to safely modify the object while iterating
@@ -2248,21 +1741,30 @@ end
                     if isinstance(item, Node):
                         self.inject_junk_code(item, is_root=False)
 
-                # IMPORTANT FIX: Only inject junk code (which are Statements) into 
-                # lists that are actually Statement Blocks (usually named 'body').
-                # Injecting statements into 'values' (assignments) or 'args' (calls) 
-                # creates invalid syntax like "local x = val, if ... end"
-                if attr_name == 'body':
+                # SAFETY CHECK: Only inject into known-safe statement block attributes
+                if attr_name in SAFE_INJECTION_ATTRS:
+                    # Additional safety: verify list contains statements, not expressions
+                    # Statements typically include If, While, Assign, LocalAssign, Return, etc.
+                    # Skip if the list appears to contain only expressions
                     
-                    # Optional: Skip root body injection if desired (handled by control flow flattening anyway)
-                    # if is_root: continue 
-
+                    if attr_value and len(attr_value) > 0:
+                        first_item = attr_value[0]
+                        # Check if first item looks like a statement (has certain attributes)
+                        is_statement_list = isinstance(first_item, (
+                            If, While, Assign, LocalAssign, LocalFunction, 
+                            Function, Return, Break, Do, Repeat, Call, Invoke
+                        )) if first_item else True
+                        
+                        if not is_statement_list:
+                            # Skip injection - this might be an expression list
+                            continue
+                    
                     new_list = []
                     for item in attr_value:
                         new_list.append(item)
                         
                         # Roll the dice for junk injection (20% chance)
-                        # Ensure we don't inject after returns or breaks
+                        # Ensure we don't inject after returns or breaks (unreachable code)
                         if not isinstance(item, (Return, Break)) and random.random() < 0.2:
                             junk_node = self.generate_junk_node()
                             if junk_node:
@@ -2270,6 +1772,11 @@ end
                     
                     # Replace the original list with the new list containing junk
                     setattr(node, attr_name, new_list)
+                
+                # Explicitly skip unsafe attributes (logged for debugging if needed)
+                elif attr_name in UNSAFE_ATTRS:
+                    # Do not inject - this is an expression context
+                    pass
 
             # If the attribute is a single Node, just recurse
             elif isinstance(attr_value, Node):
@@ -2287,7 +1794,7 @@ end
             text (str): The raw string to encrypt.
             
         Returns:
-            list: A list of integers where each byte is XORed with the dynamic key.
+            list: A list of integers where each byte is XOR'd with the dynamic key.
         """
         encrypted = []
         # Runtime component simulation - uses len("game") which is 4 in Matcha
@@ -3142,19 +2649,24 @@ if __name__ == "__main__":
     print("[*] Member Access Transformed: obj.prop -> obj[_MP[i]]")
 
     # 9. Inject Junk Code (Post Transformation)
-    print("[*] Injecting Junk Code...")
+    print("[*] Injecting Junk Code with Opaque Predicates...")
     obfuscator.inject_junk_code(obfuscator.ast)
-    print("[+] Junk Code Injected (20% Density)")
+    print("[+] Junk Code Injected (20% Density, Math-Based Predicates)")
 
-    # 10. Virtualize Binary Operations
+    # 10. Apply Equivalency Mutation (wrap values in identity functions)
+    print("[*] Applying Equivalency Mutation...")
+    obfuscator.apply_equivalency_mutation(obfuscator.ast, mutation_rate=0.25)
+    print("[+] Equivalency Mutation Applied (25% of assignments wrapped)")
+
+    # 11. Virtualize Binary Operations
     print("[*] Virtualizing Binary Operations...")
     obfuscator.virtualize_operations(obfuscator.ast)
     print(f"[+] Operations Virtualized: {len(obfuscator.virt_ops)} operator types")
 
-    # 11. Flatten Root Flow
-    print("[*] Flattening Root Control Flow...")
+    # 12. Flatten Root Flow (Enhanced with Key-Based State Machine)
+    print("[*] Flattening Root Control Flow (Key-Based State Machine)...")
     obfuscator.flatten_root_flow(obfuscator.ast)
-    print("[+] Root Control Flow Flattened")
+    print("[+] Root Control Flow Flattened with Relative Transitions")
     
     # 12. Generate Output
     print("[*] Generating output file...")
