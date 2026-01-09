@@ -270,6 +270,96 @@ class MatchaObfuscator:
         self.virt_table_name = self.generate_var_name()  # Name of the operator table
         self.virt_ops = {}  # Maps (op_type, key_modifier) -> random_key
         self.virt_key_seed = random.randint(1000, 9999)  # Seed for key generation
+        
+        # =====================================================================
+        # ADVERSARIAL CONTEXT POISONING (Anti-AI Deobfuscation)
+        # =====================================================================
+        # These misleading names are designed to confuse AI models by creating
+        # semantic misdirection. When an AI sees "UpdateSoundVolume", it assumes
+        # the function handles audio - not combat mechanics.
+        
+        # Category: Misleading function/variable names that suggest benign functionality
+        # Key = actual purpose hint, Value = misleading name pool to choose from
+        self.misleading_name_pools = {
+            # Combat/Cheat functions disguised as UI/Audio/Network
+            'combat': [
+                'UpdateLightingEffects', 'CalculateAmbientOcclusion', 'RefreshUILayout',
+                'SyncAnimationState', 'ValidateChatMessage', 'ProcessAudioBuffer',
+                'UpdateShadowMap', 'CalculateReflections', 'RefreshTextureCache',
+                'ProcessNetworkPing', 'UpdateLocalization', 'ValidateInputBuffer'
+            ],
+            # ESP/Visual cheat functions disguised as legitimate rendering
+            'visual': [
+                'RenderUIOverlay', 'UpdateFontCache', 'ProcessGlyphMetrics',
+                'CalculateTextBounds', 'RefreshLayoutConstraints', 'SyncScrollPosition',
+                'ValidateColorSpace', 'UpdateGammaCorrection', 'ProcessAntiAliasing',
+                'RenderDropShadow', 'CalculateBorderRadius', 'UpdateClipRegion'
+            ],
+            # Aimbot/Targeting disguised as camera/animation
+            'targeting': [
+                'UpdateCameraSmoothing', 'CalculateViewportBounds', 'ProcessCinematicMode',
+                'SyncCharacterAnimation', 'ValidateMotionPath', 'RefreshIKConstraints',
+                'UpdateBoneTransforms', 'CalculateAnimationBlend', 'ProcessRagdollPhysics',
+                'RenderMotionBlur', 'CalculateFocalLength', 'UpdateDepthOfField'
+            ],
+            # Memory/Data manipulation disguised as caching/logging
+            'memory': [
+                'UpdateAnalyticsCache', 'ProcessTelemetryData', 'ValidateSessionState',
+                'RefreshLeaderboardData', 'SyncAchievementProgress', 'CalculateStatistics',
+                'UpdatePerformanceMetrics', 'ProcessDebugOutput', 'ValidateConfigData',
+                'RefreshAssetManifest', 'SyncCloudSaveData', 'CalculateChecksum'
+            ],
+            # General purpose misleading names
+            'generic': [
+                'InitializeSubsystem', 'ProcessQueuedEvents', 'ValidateResourceState',
+                'UpdateCachePolicy', 'RefreshBindingContext', 'SynchronizeState',
+                'CalculateHashValue', 'ProcessDeferredUpdate', 'ValidateIntegrity',
+                'UpdateTimestamp', 'RefreshConnectionPool', 'ProcessHeartbeat'
+            ]
+        }
+        
+        # Fake comment pool - These are inserted to mislead AI about code purpose
+        # AI models heavily weight comments for understanding code semantics
+        self.fake_comment_pool = [
+            # UI/Rendering misdirection
+            "-- Adjusting UI element anchor points for responsive layout",
+            "-- Recalculating font metrics for dynamic text scaling",
+            "-- Synchronizing animation keyframes with server tick rate",
+            "-- Validating color values are within sRGB gamut",
+            "-- Processing deferred rendering queue for transparency",
+            "-- Updating shadow cascade boundaries for optimal quality",
+            # Audio misdirection
+            "-- Mixing audio channels for spatial positioning",
+            "-- Calculating reverb decay based on room geometry",
+            "-- Processing audio buffer for latency compensation",
+            "-- Adjusting doppler effect parameters for velocity",
+            # Network/Data misdirection
+            "-- Serializing state delta for network replication",
+            "-- Validating packet checksum before processing",
+            "-- Compressing analytics payload for transmission",
+            "-- Synchronizing leaderboard data with cloud service",
+            # Performance misdirection
+            "-- Profiling frame time for performance optimization",
+            "-- Garbage collecting orphaned references",
+            "-- Optimizing draw call batching for GPU efficiency",
+            "-- Caching computed values to reduce recalculation"
+        ]
+        
+        # Track which misleading names have been used to avoid duplicates
+        self.used_misleading_names = set()
+        
+        # =====================================================================
+        # LOGIC FLOODING (Hallucination Trigger for AI)
+        # =====================================================================
+        # Creates function density that overwhelms AI pattern recognition
+        
+        # Polymorphic opcode threshold - operations above this value behave differently
+        self.poly_opcode_threshold = random.randint(800, 1200)
+        
+        # Enable/disable features
+        self.enable_misleading_names = True  # Adversarial naming
+        self.enable_fake_comments = True     # Fake comment injection
+        self.enable_logic_flooding = True    # Mega-function creation
 
     def _str(self, s):
         """
@@ -283,6 +373,243 @@ class MatchaObfuscator:
             String: An AST String node
         """
         return String(s, s)
+
+    # =========================================================================
+    # ADVERSARIAL CONTEXT POISONING METHODS
+    # =========================================================================
+    
+    def generate_misleading_name(self, category='generic'):
+        """
+        Generates a misleading variable/function name from the specified category.
+        
+        These names are designed to confuse AI deobfuscators by suggesting
+        benign functionality (UI, audio, networking) when the actual code
+        performs something entirely different (combat, ESP, aimbot).
+        
+        Args:
+            category (str): One of 'combat', 'visual', 'targeting', 'memory', 'generic'
+            
+        Returns:
+            str: A misleading name that hasn't been used yet, or falls back to
+                 a generated confusing name if pool is exhausted.
+        """
+        if not self.enable_misleading_names:
+            return self.generate_var_name()
+        
+        # Get the pool for the specified category, fallback to generic
+        pool = self.misleading_name_pools.get(category, self.misleading_name_pools['generic'])
+        
+        # Find unused names in this pool
+        available = [name for name in pool if name not in self.used_misleading_names]
+        
+        if available:
+            chosen = random.choice(available)
+            self.used_misleading_names.add(chosen)
+            return chosen
+        else:
+            # Pool exhausted - generate a hybrid misleading name
+            # Combine a misleading prefix with confusing suffix
+            prefixes = ['Update', 'Calculate', 'Process', 'Validate', 'Sync', 'Refresh']
+            suffixes = ['Cache', 'Buffer', 'State', 'Metrics', 'Layout', 'Config']
+            
+            while True:
+                hybrid = random.choice(prefixes) + random.choice(suffixes) + str(random.randint(1, 999))
+                if hybrid not in self.used_misleading_names:
+                    self.used_misleading_names.add(hybrid)
+                    return hybrid
+    
+    def get_random_fake_comment(self):
+        """
+        Returns a random fake comment designed to mislead AI about code purpose.
+        
+        AI models heavily weight comments for semantic understanding.
+        These comments describe operations completely unrelated to what
+        the actual code does, causing AI to hallucinate wrong functionality.
+        
+        Returns:
+            str: A misleading comment string (includes -- prefix)
+        """
+        if not self.enable_fake_comments:
+            return ""
+        return random.choice(self.fake_comment_pool)
+    
+    def generate_fake_comment_block(self, num_comments=3):
+        """
+        Generates a block of fake comments for insertion into generated code.
+        
+        Multiple comments together create stronger semantic misdirection,
+        making AI more confident in its wrong interpretation.
+        
+        Args:
+            num_comments (int): Number of fake comments to generate
+            
+        Returns:
+            str: Multiple newline-separated fake comments
+        """
+        if not self.enable_fake_comments:
+            return ""
+        
+        comments = []
+        used = set()
+        for _ in range(num_comments):
+            # Avoid duplicate comments in same block
+            available = [c for c in self.fake_comment_pool if c not in used]
+            if available:
+                comment = random.choice(available)
+                used.add(comment)
+                comments.append(comment)
+        
+        return '\n'.join(comments)
+    
+    # =========================================================================
+    # LOGIC FLOODING - MEGA FUNCTION GENERATOR
+    # =========================================================================
+    
+    def generate_mega_dispatch_function(self):
+        """
+        Generates a massive polymorphic dispatch function that handles 50+ operations.
+        
+        This creates extreme "function density" that overwhelms AI pattern recognition.
+        The function uses a complex dispatch mechanism where:
+        1. Primary opcode determines general category
+        2. Secondary modifier determines specific operation
+        3. Accumulator value can flip behavior (polymorphic instructions)
+        
+        POLYMORPHIC BEHAVIOR:
+        - Opcode 5 usually adds, but if input > threshold, it subtracts
+        - This destroys AI's ability to summarize opcodes simply
+        
+        Returns:
+            str: Lua code for the mega dispatch function
+        """
+        func_name = self.generate_misleading_name('generic')  # Misleading name
+        self.mega_dispatch_name = func_name
+        
+        # Generate random opcode assignments
+        # Each opcode maps to an operation, but behavior changes based on accumulator
+        opcodes = {}
+        for i in range(1, 51):  # 50 opcodes
+            opcodes[i] = {
+                'primary': random.randint(100, 999),
+                'modifier': random.randint(10, 99),
+                'threshold': self.poly_opcode_threshold
+            }
+        
+        # Fake comment to mislead about purpose
+        header_comment = self.generate_fake_comment_block(2)
+        
+        lines = [header_comment]
+        lines.append(f"local {func_name} = function(op, a, b, acc)")
+        lines.append(f"    {self.get_random_fake_comment()}")
+        lines.append("    local r = nil")
+        
+        # Generate the massive dispatch logic
+        # Shuffle operations for non-obvious ordering
+        ops = [
+            ('add', 'a + b', 'a - b'),           # Polymorphic: add or sub based on acc
+            ('sub', 'a - b', 'a + b'),           # Polymorphic: sub or add
+            ('mul', 'a * b', 'a / (b ~= 0 and b or 1)'),  # Polymorphic: mul or div
+            ('div', 'a / (b ~= 0 and b or 1)', 'a * b'),  # Polymorphic: div or mul
+            ('mod', 'a % (b ~= 0 and b or 1)', 'math.floor(a / (b ~= 0 and b or 1))'),
+            ('pow', 'a ^ b', 'math.sqrt(math.abs(a))'),
+            ('neg', '-a', 'math.abs(a)'),
+            ('floor', 'math.floor(a)', 'math.ceil(a)'),
+            ('ceil', 'math.ceil(a)', 'math.floor(a)'),
+            ('abs', 'math.abs(a)', '-math.abs(a)'),
+            ('min', 'math.min(a, b)', 'math.max(a, b)'),
+            ('max', 'math.max(a, b)', 'math.min(a, b)'),
+            ('sin', 'math.sin(a)', 'math.cos(a)'),
+            ('cos', 'math.cos(a)', 'math.sin(a)'),
+            ('tan', 'math.tan(a)', '1 / math.tan(a ~= 0 and a or 0.001)'),
+            ('sqrt', 'math.sqrt(math.abs(a))', 'a * a'),
+            ('log', 'math.log(math.abs(a) + 1)', 'math.exp(a)'),
+            ('exp', 'math.exp(math.min(a, 20))', 'math.log(math.abs(a) + 1)'),
+            ('eq', 'a == b', 'a ~= b'),
+            ('neq', 'a ~= b', 'a == b'),
+            ('lt', 'a < b', 'a >= b'),
+            ('gt', 'a > b', 'a <= b'),
+            ('le', 'a <= b', 'a > b'),
+            ('ge', 'a >= b', 'a < b'),
+            ('band', 'math.floor(a) % 256', 'math.floor(b) % 256'),  # Simplified bit ops
+            ('bor', '(math.floor(a) + math.floor(b)) % 256', 'math.abs(math.floor(a) - math.floor(b)) % 256'),
+            ('bxor', 'math.abs(math.floor(a) - math.floor(b)) % 256', '(math.floor(a) + math.floor(b)) % 256'),
+            ('lshift', 'math.floor(a) * (2 ^ math.min(b, 16))', 'math.floor(a / (2 ^ math.min(b, 16)))'),
+            ('rshift', 'math.floor(a / (2 ^ math.min(b, 16)))', 'math.floor(a) * (2 ^ math.min(b, 16))'),
+            ('clamp', 'math.max(0, math.min(a, b))', 'math.min(0, math.max(a, -b))'),
+            ('lerp', 'a + (b - a) * 0.5', 'b + (a - b) * 0.5'),
+            ('sign', 'a > 0 and 1 or (a < 0 and -1 or 0)', 'a >= 0 and 1 or -1'),
+            ('round', 'math.floor(a + 0.5)', 'math.ceil(a - 0.5)'),
+            ('frac', 'a - math.floor(a)', 'math.ceil(a) - a'),
+            ('wrap', 'a % (b ~= 0 and b or 360)', '(a + b) % (b ~= 0 and b or 360)'),
+            ('deg', 'math.deg(a)', 'math.rad(a)'),
+            ('rad', 'math.rad(a)', 'math.deg(a)'),
+            ('atan2', 'math.atan2(a, b ~= 0 and b or 0.001)', 'math.atan(a / (b ~= 0 and b or 0.001))'),
+            ('hypot', 'math.sqrt(a*a + b*b)', 'math.abs(a) + math.abs(b)'),
+            ('avg', '(a + b) / 2', 'math.abs(a - b) / 2'),
+        ]
+        
+        # Randomize order
+        random.shuffle(ops)
+        
+        # Assign opcodes
+        self.mega_opcodes = {}
+        for i, (name, normal_op, poly_op) in enumerate(ops[:40]):  # Use first 40
+            opcode = random.randint(100, 9999)
+            while opcode in self.mega_opcodes.values():
+                opcode = random.randint(100, 9999)
+            self.mega_opcodes[name] = opcode
+            
+            # Generate the polymorphic condition
+            # If accumulator > threshold, use alternate behavior
+            lines.append(f"    if op == {opcode} then")
+            lines.append(f"        {self.get_random_fake_comment()}")
+            lines.append(f"        if acc and acc > {self.poly_opcode_threshold} then")
+            lines.append(f"            r = {poly_op}")
+            lines.append(f"        else")
+            lines.append(f"            r = {normal_op}")
+            lines.append(f"        end")
+            lines.append(f"    end")
+        
+        # Add decoy opcodes that do nothing useful (more confusion)
+        for _ in range(10):
+            decoy_op = random.randint(10000, 19999)
+            decoy_result = random.choice(['nil', '0', 'false', 'a', '""', '{}'])
+            lines.append(f"    if op == {decoy_op} then r = {decoy_result} end")
+        
+        lines.append(f"    {self.get_random_fake_comment()}")
+        lines.append("    return r")
+        lines.append("end")
+        
+        return '\n'.join(lines) + '\n'
+    
+    def get_mega_dispatch_call(self, op_name, left_node, right_node, accumulator=None):
+        """
+        Creates an AST node for calling the mega dispatch function.
+        
+        Args:
+            op_name (str): Operation name (e.g., 'add', 'sub')
+            left_node: Left operand AST node
+            right_node: Right operand AST node  
+            accumulator: Optional accumulator value for polymorphic behavior
+            
+        Returns:
+            Call: AST Call node for mega_dispatch(opcode, a, b, acc)
+        """
+        if not hasattr(self, 'mega_opcodes') or op_name not in self.mega_opcodes:
+            return None
+        
+        opcode = self.mega_opcodes[op_name]
+        
+        # Create the function call
+        args = [Number(opcode), left_node, right_node]
+        
+        if accumulator is not None:
+            args.append(Number(accumulator))
+        else:
+            # Random accumulator below threshold for normal behavior
+            args.append(Number(random.randint(1, self.poly_opcode_threshold - 100)))
+        
+        return Call(Name(self.mega_dispatch_name), args)
 
     def generate_var_name(self):
         """
@@ -952,71 +1279,117 @@ class MatchaObfuscator:
         This creates a table of anonymous functions, each performing a basic
         operation. Uses clean arithmetic to support Vectors and other userdata types.
         
+        ANTI-AI ENHANCEMENT:
+        - Adds misleading fake comments before each operation
+        - Uses misleading local variable names within functions
+        - Interleaves decoy functions that are never called
+        
         Returns:
             str: Lua code defining the operators table
         """
         lines = []
+        
+        # Add a misleading header comment block
+        if self.enable_fake_comments:
+            lines.append(self.get_random_fake_comment())
+            lines.append("-- Virtualized texture sampling pipeline")
+        
         lines.append(f"local {self.virt_table_name} = {{}}")
+        
+        # Misleading internal variable names for the lambda parameters
+        # AI sees "texCoord, normalMap" and thinks this is rendering code
+        misleading_params = [
+            ('texCoord', 'normalMap'),
+            ('audioLevel', 'mixRatio'),
+            ('uiScale', 'anchorOffset'),
+            ('netLatency', 'packetId'),
+            ('fontMetric', 'glyphIndex'),
+            ('shadowBias', 'cascadeLevel'),
+        ]
         
         # Generate functions for each registered operation
         # Using clean arithmetic (no modifiers) to support Vectors/userdata
+        op_index = 0
         for op_type, key in self.virt_ops.items():
+            # Select misleading parameter names
+            param_a, param_b = misleading_params[op_index % len(misleading_params)]
+            op_index += 1
+            
+            # Add a fake comment before each operation (50% chance)
+            if self.enable_fake_comments and random.random() < 0.5:
+                lines.append(self.get_random_fake_comment())
             
             if op_type == 'add':
                 # Clean addition - supports Numbers, Vectors, etc.
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a + b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} + {param_b} end")
                 
             elif op_type == 'sub':
                 # Clean subtraction - supports Numbers, Vectors, etc.
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a - b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} - {param_b} end")
                 
             elif op_type == 'mul':
                 # Clean multiplication - supports Numbers, Vectors, etc.
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a * b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} * {param_b} end")
                 
             elif op_type == 'div':
                 # Clean division - supports Numbers, Vectors, etc.
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a / b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} / {param_b} end")
                 
             elif op_type == 'mod':
                 # Modulo
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a % b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} % {param_b} end")
                 
             elif op_type == 'eq':
                 # Equality
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a == b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} == {param_b} end")
                 
             elif op_type == 'neq':
                 # Not equal
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a ~= b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} ~= {param_b} end")
                 
             elif op_type == 'lt':
                 # Less than
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a < b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} < {param_b} end")
                 
             elif op_type == 'gt':
                 # Greater than
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a > b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} > {param_b} end")
                 
             elif op_type == 'le':
                 # Less or equal
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a <= b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} <= {param_b} end")
                 
             elif op_type == 'ge':
                 # Greater or equal
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a >= b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} >= {param_b} end")
                 
             elif op_type == 'and_op':
                 # Logical and
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a and b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} and {param_b} end")
                 
             elif op_type == 'or_op':
                 # Logical or
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a or b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} or {param_b} end")
                 
             elif op_type == 'concat':
                 # String concatenation
-                lines.append(f"{self.virt_table_name}[{key}] = function(a, b) return a .. b end")
+                lines.append(f"{self.virt_table_name}[{key}] = function({param_a}, {param_b}) return {param_a} .. {param_b} end")
+        
+        # Add decoy functions (never called, but confuse analysis)
+        # These use keys that will never be used
+        decoy_comments = [
+            "-- Texture coordinate transformation",
+            "-- Audio channel mixing",
+            "-- UI layout recalculation",
+            "-- Network packet validation"
+        ]
+        for i in range(3):
+            decoy_key = random.randint(90000, 99999)
+            decoy_param_a, decoy_param_b = random.choice(misleading_params)
+            if self.enable_fake_comments:
+                lines.append(random.choice(decoy_comments))
+            # Decoy functions return garbage that will never execute
+            lines.append(f"{self.virt_table_name}[{decoy_key}] = function({decoy_param_a}, {decoy_param_b}) return nil end")
         
         return "\n".join(lines) + "\n"
     
@@ -1808,17 +2181,32 @@ class MatchaObfuscator:
             encrypted.append(enc_byte)
         return encrypted
 
-    def minify_source(self, source):
+    def minify_source(self, source, preserve_fake_comments=True):
         """
         Minifies Lua source code by removing comments, empty lines, and indentation.
         Preserves string literals that may contain special characters.
         
+        ANTI-AI ENHANCEMENT:
+        When preserve_fake_comments is True, keeps comments that appear to be
+        from our fake comment pool. This creates semantic misdirection for AI.
+        
         Args:
             source (str): The Lua source code to minify.
+            preserve_fake_comments (bool): If True, keeps misleading comments
             
         Returns:
             str: The minified source code.
         """
+        # Keywords that indicate a fake comment worth keeping
+        fake_comment_indicators = [
+            'Adjusting', 'Recalculating', 'Synchronizing', 'Validating',
+            'Processing', 'Updating', 'Mixing', 'Calculating', 'Serializing',
+            'Compressing', 'Profiling', 'Garbage', 'Optimizing', 'Caching',
+            'texture', 'font', 'animation', 'color', 'rendering', 'shadow',
+            'audio', 'reverb', 'buffer', 'doppler', 'network', 'packet',
+            'analytics', 'leaderboard', 'frame', 'draw call', 'GPU'
+        ]
+        
         result = []
         i = 0
         length = len(source)
@@ -1887,14 +2275,31 @@ class MatchaObfuscator:
                         while i < length and source[i] != '\n':
                             i += 1
                 else:
-                    # Single-line comment - skip to end of line
+                    # Single-line comment - check if it's a fake comment to preserve
+                    comment_start = i
+                    i += 2  # Skip --
                     while i < length and source[i] != '\n':
                         i += 1
+                    
+                    # Extract the comment text
+                    comment_text = source[comment_start:i]
+                    
+                    # Check if this comment should be preserved for AI confusion
+                    should_preserve = False
+                    if preserve_fake_comments and self.enable_fake_comments:
+                        for indicator in fake_comment_indicators:
+                            if indicator.lower() in comment_text.lower():
+                                should_preserve = True
+                                break
+                    
+                    if should_preserve:
+                        # Keep this fake comment
+                        result.append(comment_text)
             else:
                 result.append(source[i])
                 i += 1
         
-        # Now process the comment-free source
+        # Now process the source
         source = ''.join(result)
         
         # Split into lines, strip whitespace, and filter empty lines
@@ -2577,20 +2982,45 @@ end
         if self.virt_ops:
             virt_ops_lua = self.generate_virtualized_ops_table()
         
+        # 2.5. Generate Mega Dispatch Function (Logic Flooding for AI confusion)
+        mega_dispatch_lua = ""
+        if self.enable_logic_flooding:
+            mega_dispatch_lua = self.generate_mega_dispatch_function()
+        
         # 3. Generate the Script Body
         # Use ast.to_lua_source(self.ast) to convert modified tree back to Lua source
         script_lua = ast.to_lua_source(self.ast)
         
         # 4. Combine and Write
-        # Order: Polyfill -> Decryptor -> Constant Pool -> Virt Ops -> Script
-        final_output = bit32_polyfill + "\n" + decryptor_lua + pool_lua + "\n\n" + virt_ops_lua + "\n" + script_lua
+        # Order: Polyfill -> Decryptor -> Constant Pool -> Mega Dispatch -> Virt Ops -> Script
+        final_output = bit32_polyfill + "\n" + decryptor_lua + pool_lua + "\n\n" + mega_dispatch_lua + "\n" + virt_ops_lua + "\n" + script_lua
         
         # 4. Minify the output (remove comments, empty lines, indentation)
         final_output = self.minify_source(final_output)
         
-        # 5. Add fake header to mislead reverse engineers
-        fake_header = "-- Roblox Internal Script // Autogenerated\n"
-        final_output = fake_header + final_output
+        # 5. Add fake headers with misleading comments to poison AI context
+        # Multiple fake headers create stronger semantic misdirection
+        fake_headers = [
+            "-- Roblox Studio Internal Plugin // Auto-generated UI Framework",
+            "-- WARNING: This file was generated by Roblox's internal build system",
+            "-- Module: RenderingPipeline.UILayoutManager v3.2.1",
+            "-- Purpose: Handles responsive UI layout calculations and font rendering",
+            "-- Dependencies: TextService, GuiService, UserInputService",
+            "-- DO NOT MODIFY: Changes will be overwritten on next build",
+            "-- Contact: rendering-team@roblox.com for questions"
+        ]
+        
+        # Select 3-4 fake headers randomly
+        selected_headers = random.sample(fake_headers, min(4, len(fake_headers)))
+        fake_header = '\n'.join(selected_headers) + '\n'
+        
+        # Inject additional fake comments throughout (if enabled)
+        if self.enable_fake_comments:
+            # Add some fake inline comments at strategic points
+            fake_inline = self.generate_fake_comment_block(2)
+            final_output = fake_header + fake_inline + '\n' + final_output
+        else:
+            final_output = fake_header + final_output
         
         try:
             with open(self.output_file, 'w', encoding='utf-8') as f:
@@ -2668,7 +3098,15 @@ if __name__ == "__main__":
     obfuscator.flatten_root_flow(obfuscator.ast)
     print("[+] Root Control Flow Flattened with Relative Transitions")
     
-    # 12. Generate Output
+    # 13. Anti-AI Deobfuscation Features Status
+    print("[*] Anti-AI Deobfuscation Features:")
+    print(f"    [{'✓' if obfuscator.enable_misleading_names else '✗'}] Adversarial Context Poisoning (Misleading Names)")
+    print(f"    [{'✓' if obfuscator.enable_fake_comments else '✗'}] Fake Comment Injection")
+    print(f"    [{'✓' if obfuscator.enable_logic_flooding else '✗'}] Logic Flooding (Mega Dispatch Function)")
+    print(f"    [+] Polymorphic Opcode Threshold: {obfuscator.poly_opcode_threshold}")
+    print(f"    [+] Misleading Names Used: {len(obfuscator.used_misleading_names)}")
+    
+    # 14. Generate Output
     print("[*] Generating output file...")
     obfuscator.generate_output()
     print(f"[+] Obfuscated script written to {obfuscator.output_file}")
