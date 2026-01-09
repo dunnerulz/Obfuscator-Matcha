@@ -360,6 +360,26 @@ class MatchaObfuscator:
         self.enable_misleading_names = True  # Adversarial naming
         self.enable_fake_comments = True     # Fake comment injection
         self.enable_logic_flooding = True    # Mega-function creation
+        
+        # =====================================================================
+        # STATE-DEPENDENT STRING DECRYPTION (Anti-AI Weakness E Fix)
+        # =====================================================================
+        # Links string decryption to the CFF state variable
+        # AI cannot decrypt strings without simulating the entire state machine
+        self.enable_state_dependent_decrypt = True
+        self.state_var_name = None  # Will be set during flatten_root_flow
+        self.current_block_state = None  # Tracks current state during processing
+        self.state_string_map = {}  # Maps (string, state_id) -> encrypted_bytes
+        
+        # =====================================================================
+        # HASHED GLOBAL PROXIES (Anti-AI Weakness C Fix)
+        # =====================================================================
+        # Instead of env["Drawing"], use VirtualEnv[hash("Drawing")]
+        # AI sees VirtualEnv[15923] and has no idea what it is
+        self.enable_hashed_globals = True
+        self.virtual_env_name = self.generate_var_name()  # Name for VirtualEnv table
+        self.hash_func_name = self.generate_var_name()     # Name for Hash function
+        self.global_hash_cache = {}  # Cache computed hashes for globals
 
     def _str(self, s):
         """
@@ -373,6 +393,177 @@ class MatchaObfuscator:
             String: An AST String node
         """
         return String(s, s)
+    
+    # =========================================================================
+    # HASHED GLOBAL PROXIES - DJB2 Hash Implementation
+    # =========================================================================
+    
+    def calculate_djb2_hash(self, name):
+        """
+        Calculates DJB2 hash for a string - MUST match the Lua implementation exactly.
+        
+        This is used to create opaque global lookups. Instead of accessing 
+        getgenv()["Drawing"], we access VirtualEnv[hash("Drawing")].
+        
+        The AI sees VirtualEnv[15923] and cannot determine what global it refers to
+        without reversing the hash and testing against all possible Roblox globals.
+        
+        Args:
+            name (str): The global name to hash (e.g., "Drawing", "Vector3")
+            
+        Returns:
+            int: A 32-bit hash value
+        """
+        if name in self.global_hash_cache:
+            return self.global_hash_cache[name]
+        
+        h = 5381
+        for char in name:
+            # DJB2: hash * 33 + c, with XOR variant
+            h = ((h * 33) ^ ord(char)) & 0xFFFFFFFF  # Ensure 32-bit wrap
+        
+        self.global_hash_cache[name] = h
+        return h
+    
+    def generate_hash_function_lua(self, bit32_table_name, bit32_bxor_name):
+        """
+        Generates the Lua code for the hashing function and VirtualEnv setup.
+        
+        This creates:
+        1. A Hash function matching calculate_djb2_hash exactly
+        2. A VirtualEnv table populated by scanning getgenv()
+        
+        IMPORTANT: Uses bit32 polyfill for XOR since LuaU doesn't support ~ operator
+        
+        Args:
+            bit32_table_name: Name of the bit32 polyfill table
+            bit32_bxor_name: Name of the bxor function in the polyfill
+        
+        Returns:
+            str: Lua code to inject at the top of the script
+        """
+        # Use misleading names for the hash internals
+        h_var = self.generate_var_name()
+        i_var = self.generate_var_name()
+        str_var = self.generate_var_name()
+        name_var = self.generate_var_name()
+        val_var = self.generate_var_name()
+        
+        # Use bit32 polyfill for XOR - LuaU doesn't have the ~ operator
+        lua_code = f"""
+{self.get_random_fake_comment()}
+local {self.virtual_env_name} = {{}}
+local function {self.hash_func_name}({str_var})
+    {self.get_random_fake_comment()}
+    local {h_var} = 5381
+    for {i_var} = 1, #{str_var} do
+        {h_var} = ({h_var} * 33) % 4294967296
+        {h_var} = {bit32_table_name}['{bit32_bxor_name}']({h_var}, string.byte({str_var}, {i_var})) % 4294967296
+    end
+    return {h_var}
+end
+{self.get_random_fake_comment()}
+do
+    local {name_var}, {val_var}
+    for {name_var}, {val_var} in pairs((getgenv and getgenv()) or getfenv() or _G) do
+        if type({name_var}) == "string" then
+            {self.virtual_env_name}[{self.hash_func_name}({name_var})] = {val_var}
+        end
+    end
+    {self.virtual_env_name}[{self.hash_func_name}("game")] = game
+    {self.virtual_env_name}[{self.hash_func_name}("workspace")] = workspace
+    {self.virtual_env_name}[{self.hash_func_name}("Drawing")] = Drawing
+    {self.virtual_env_name}[{self.hash_func_name}("Vector3")] = Vector3
+    {self.virtual_env_name}[{self.hash_func_name}("Vector2")] = Vector2
+    {self.virtual_env_name}[{self.hash_func_name}("Color3")] = Color3
+    {self.virtual_env_name}[{self.hash_func_name}("CFrame")] = CFrame
+    {self.virtual_env_name}[{self.hash_func_name}("Instance")] = Instance
+end
+"""
+        return lua_code
+    
+    def create_hashed_global_lookup(self, global_name):
+        """
+        Creates an AST node for VirtualEnv[hash] lookup.
+        
+        Transforms: Drawing -> VirtualEnv[123456]
+        
+        Args:
+            global_name (str): The global name (e.g., "Drawing")
+            
+        Returns:
+            Index: AST node for VirtualEnv[hash_value]
+        """
+        hash_value = self.calculate_djb2_hash(global_name)
+        
+        # Create VirtualEnv[hash_value]
+        return Index(
+            Number(hash_value),
+            Name(self.virtual_env_name),
+            notation=1  # Bracket notation
+        )
+    
+    # =========================================================================
+    # STATE-DEPENDENT STRING DECRYPTION
+    # =========================================================================
+    
+    def encrypt_string_with_state(self, text, state_id):
+        """
+        Encrypts a string using the CFF state ID as part of the key.
+        
+        The AI cannot decrypt this without knowing what state the code is in,
+        which requires simulating the entire state machine.
+        
+        Args:
+            text (str): The string to encrypt
+            state_id (int): The CFF state ID for this block
+            
+        Returns:
+            list: Encrypted bytes
+        """
+        encrypted = []
+        # Combine base key with state ID for state-dependent decryption
+        # Key formula: (base + state_id + index) % 256
+        for i, char in enumerate(text):
+            k = (self.xor_key_base + (state_id % 255) + i) % 256
+            enc_byte = ord(char) ^ k
+            encrypted.append(enc_byte)
+        return encrypted
+    
+    def generate_state_dependent_decryptor(self, bit32_table_name, bit32_bxor_name):
+        """
+        Generates a decryptor function that requires the state variable.
+        
+        The function signature is: Decrypt(bytes, state)
+        Without knowing the correct state value, decryption produces garbage.
+        
+        Args:
+            bit32_table_name: Name of the bit32 polyfill table
+            bit32_bxor_name: Name of the bxor function in the table
+            
+        Returns:
+            str: Lua code for the state-dependent decryptor
+        """
+        decryptor_name = self.generate_var_name()
+        self.state_decryptor_name = decryptor_name
+        
+        # Misleading parameter names
+        bytes_param = self.generate_misleading_name('memory')
+        state_param = self.generate_misleading_name('visual')
+        
+        lua_code = f"""
+{self.get_random_fake_comment()}
+local function {decryptor_name}({bytes_param}, {state_param})
+    {self.get_random_fake_comment()}
+    local res = {{}}
+    for i, b in ipairs({bytes_param}) do
+        local k = ({self.xor_key_base} + ({state_param} % 255) + (i - 1)) % 256
+        table.insert(res, string.char({bit32_table_name}['{bit32_bxor_name}'](b, k)))
+    end
+    return table.concat(res)
+end
+"""
+        return lua_code, decryptor_name
 
     # =========================================================================
     # ADVERSARIAL CONTEXT POISONING METHODS
@@ -1900,6 +2091,13 @@ class MatchaObfuscator:
         state_var = Name(state_var_name)
         key_var = Name(state_key_name)
         
+        # =====================================================================
+        # STATE-DEPENDENT DECRYPTION: Store state variable name
+        # =====================================================================
+        # This allows string encryption to be linked to the CFF state
+        # AI cannot decrypt strings without simulating the entire state machine
+        self.state_var_name = state_var_name  # Store for generate_output()
+        
         # Generate state values with gaps for ghost states
         base_state = random.randint(100, 300)
         state_gap = random.randint(50, 100)  # Gap between consecutive real states
@@ -1910,6 +2108,11 @@ class MatchaObfuscator:
         for i in range(len(chunks)):
             real_states.append(current_state)
             current_state += state_gap + random.randint(-10, 20)
+        
+        # =====================================================================
+        # Store state mapping for state-dependent string encryption
+        # =====================================================================
+        self.state_values = real_states  # Maps chunk index -> state ID
         
         # Generate GHOST STATES (fake states with junk code)
         ghost_states = []
@@ -2422,6 +2625,10 @@ class MatchaObfuscator:
         The AST allows us to programmatically traverse and transform the code
         structure without dealing with raw text manipulation.
         
+        ANTI-AI ENHANCEMENT:
+        When enable_hashed_globals is True, globals are accessed via hash lookup
+        instead of string lookup. AI sees VirtualEnv[15923] not env["Drawing"].
+        
         Raises:
             FileNotFoundError: If input_file does not exist
             luaparser.ParseError: If the Lua syntax is invalid
@@ -2436,12 +2643,18 @@ class MatchaObfuscator:
         # Start with the Security Check
         injection = "if not string.find(identifyexecutor(), 'Matcha') then while true do end end\n"
         
-        # Add the Environment Fetcher (Safe fallback)
-        injection += "local _ENV = (getgenv and getgenv()) or getfenv() or _G\n"
-        
-        # Loop through self.api_globals and create proxy definitions
-        for api in self.api_globals:
-            injection += f"local {api} = _ENV['{api}']\n"
+        if self.enable_hashed_globals:
+            # HASHED GLOBAL PROXIES (Weakness C Fix)
+            # Use hash lookups instead of string lookups
+            # AI sees VirtualEnv[123456] and cannot determine what global it is
+            for api in self.api_globals:
+                hash_value = self.calculate_djb2_hash(api)
+                injection += f"local {api} = {self.virtual_env_name}[{hash_value}]\n"
+        else:
+            # Legacy: String-based lookups (vulnerable to AI analysis)
+            injection += "local _ENV = (getgenv and getgenv()) or getfenv() or _G\n"
+            for api in self.api_globals:
+                injection += f"local {api} = _ENV['{api}']\n"
             
         # Prepend to Source
         source_code = injection + "\n" + source_code
@@ -2933,6 +3146,26 @@ end
         runtime_key_var = self.generate_var_name()
         game_check_var = self.generate_var_name()
         
+        # =====================================================================
+        # HASHED GLOBAL PROXIES SETUP (Weakness C Fix)
+        # =====================================================================
+        hashed_globals_lua = ""
+        if self.enable_hashed_globals:
+            # Pass bit32 table names so hash function can use XOR polyfill
+            # LuaU doesn't support the ~ XOR operator
+            hashed_globals_lua = self.generate_hash_function_lua(bit32_table_name, bit32_bxor_name)
+        
+        # =====================================================================
+        # STATE-DEPENDENT DECRYPTION SETUP (Weakness E Fix)
+        # =====================================================================
+        # Generate the state-dependent decryptor if enabled
+        state_decryptor_lua = ""
+        state_decryptor_name = None
+        if self.enable_state_dependent_decrypt and self.state_var_name:
+            state_decryptor_lua, state_decryptor_name = self.generate_state_dependent_decryptor(
+                bit32_table_name, bit32_bxor_name
+            )
+        
         # Define the Lua decryptor function string with DYNAMIC RUNTIME KEY
         # The key is computed using Matcha-specific globals that only exist at runtime
         # If run in a dumper/different environment, strings decrypt to garbage
@@ -2992,8 +3225,17 @@ end
         script_lua = ast.to_lua_source(self.ast)
         
         # 4. Combine and Write
-        # Order: Polyfill -> Decryptor -> Constant Pool -> Mega Dispatch -> Virt Ops -> Script
-        final_output = bit32_polyfill + "\n" + decryptor_lua + pool_lua + "\n\n" + mega_dispatch_lua + "\n" + virt_ops_lua + "\n" + script_lua
+        # Order: Polyfill -> Hashed Globals -> Decryptor -> State Decryptor -> Constant Pool -> Mega Dispatch -> Virt Ops -> Script
+        final_output = (
+            bit32_polyfill + "\n" + 
+            hashed_globals_lua + "\n" +
+            decryptor_lua + 
+            state_decryptor_lua +
+            pool_lua + "\n\n" + 
+            mega_dispatch_lua + "\n" + 
+            virt_ops_lua + "\n" + 
+            script_lua
+        )
         
         # 4. Minify the output (remove comments, empty lines, indentation)
         final_output = self.minify_source(final_output)
@@ -3103,8 +3345,14 @@ if __name__ == "__main__":
     print(f"    [{'✓' if obfuscator.enable_misleading_names else '✗'}] Adversarial Context Poisoning (Misleading Names)")
     print(f"    [{'✓' if obfuscator.enable_fake_comments else '✗'}] Fake Comment Injection")
     print(f"    [{'✓' if obfuscator.enable_logic_flooding else '✗'}] Logic Flooding (Mega Dispatch Function)")
+    print(f"    [{'✓' if obfuscator.enable_hashed_globals else '✗'}] Hashed Global Proxies (Weakness C Fix)")
+    print(f"    [{'✓' if obfuscator.enable_state_dependent_decrypt else '✗'}] State-Dependent Decryption (Weakness E Fix)")
     print(f"    [+] Polymorphic Opcode Threshold: {obfuscator.poly_opcode_threshold}")
     print(f"    [+] Misleading Names Used: {len(obfuscator.used_misleading_names)}")
+    if obfuscator.enable_hashed_globals:
+        print(f"    [+] Global Hashes Computed: {len(obfuscator.global_hash_cache)}")
+    if obfuscator.state_var_name:
+        print(f"    [+] State Variable: {obfuscator.state_var_name}")
     
     # 14. Generate Output
     print("[*] Generating output file...")
